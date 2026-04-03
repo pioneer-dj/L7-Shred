@@ -1,0 +1,25 @@
+{
+  "server": "your-server.com:443",
+  "mode": "dual",
+  "protocol": "webrtc",
+  "secret_key": "base64_encoded_32_byte_secret_key_here",
+  "cipher": "aes-256-gcm",
+  "post_quantum": true,
+  "mtu": 1500,
+  "multi_threading": true,
+  "padding": {
+    "enabled": true,
+    "min": 32,
+    "max": 288
+  },
+  "jitter": {
+    "enabled": true,
+    "mean_ms": 1,
+    "stddev_ms": 0.5
+  },
+  "chaffing": {
+    "enabled": true,
+    "interval": 10,
+    "targets": ["google.com", "microsoft.com"]
+  }
+}

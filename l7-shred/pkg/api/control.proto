@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package api;
+
+option go_package = "github.com/l7-shred/core/api";
+
+service Control {
+  rpc GetConfig(Empty) returns (Config);
+  rpc GetStatus(Empty) returns (Status);
+  rpc UpdateConfig(Config) returns (Status);
+}
+
+message Empty {}
+
+message Config {
+  int32 listen_port = 1;
+  bytes secret_key = 2;
+  string mode = 3;
+}
+
+message Status {
+  bool connected = 1;
+  uint64 bytes_in = 2;
+  uint64 bytes_out = 3;
+  int32 latency = 4;
+  uint64 session_id = 5;
+}

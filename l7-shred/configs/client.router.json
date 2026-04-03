@@ -1,0 +1,18 @@
+{
+  "server": "your-server.com:443",
+  "mode": "tcp",
+  "protocol": "winupdate",
+  "secret_key": "base64_encoded_32_byte_secret_key_here",
+  "cipher": "aes-256-gcm",
+  "post_quantum": false,
+  "mtu": 1400,
+  "bypass_cn": true,
+  "routing": {
+    "direct": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+    "block": ["0.0.0.0/8", "169.254.0.0/16"]
+  },
+  "dns": {
+    "server": "8.8.8.8",
+    "over_https": true
+  }
+}

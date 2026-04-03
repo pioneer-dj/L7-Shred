@@ -1,0 +1,21 @@
+{
+  "server": "your-server.com:443",
+  "mode": "udp",
+  "protocol": "quic",
+  "secret_key": "base64_encoded_32_byte_secret_key_here",
+  "cipher": "chacha20-poly1305",
+  "post_quantum": true,
+  "mtu": 1350,
+  "padding": {
+    "enabled": true,
+    "min": 32,
+    "max": 256
+  },
+  "jitter": {
+    "enabled": true,
+    "mean_ms": 3,
+    "stddev_ms": 2
+  },
+  "battery_saver": true,
+  "roaming": true
+}

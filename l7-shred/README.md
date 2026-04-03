@@ -1,0 +1,11 @@
+/bin/
+/configs/local/
+*.log
+*.pcap
+*.key
+*.crt
+.DS_Store
+*.swp
+*.test
+*.out
+coverage.out
