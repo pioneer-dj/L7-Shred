@@ -1,13 +1,16 @@
 package masks
 
 import (
+	"bytes"
 	"crypto/rand"
-	"encoding/base64"
+	"encoding/binary"
+	"fmt"
 )
 
 type DNSOverHTTPSMask struct {
-	queryID uint16
-	random  []byte
+	queryID    uint16
+	random     []byte
+	dnsMessage []byte
 }
 
 func NewDNSOverHTTPSMask() *DNSOverHTTPSMask {
@@ -25,24 +28,39 @@ func (d *DNSOverHTTPSMask) Wrap(payload []byte) []byte {
 
 	dnsMsg := make([]byte, 12+len(payload))
 
-	dnsMsg[0] = byte(d.queryID >> 8)
-	dnsMsg[1] = byte(d.queryID & 0xFF)
-	dnsMsg[2] = 0x01
-	dnsMsg[3] = 0x00
-	dnsMsg[4] = 0x00
-	dnsMsg[5] = 0x01
-	dnsMsg[6] = 0x00
-	dnsMsg[7] = 0x00
-	dnsMsg[8] = 0x00
-	dnsMsg[9] = 0x00
-	dnsMsg[10] = 0x00
-	dnsMsg[11] = 0x00
+	binary.BigEndian.PutUint16(dnsMsg[0:2], d.queryID)
+	dnsMsg[2] = 0x01                             // QR=0, Opcode=0, AA=0, TC=0, RD=1
+	dnsMsg[3] = 0x00                             // RA=0, Z=0, RCODE=0
+	binary.BigEndian.PutUint16(dnsMsg[4:6], 1)   // QDCOUNT
+	binary.BigEndian.PutUint16(dnsMsg[6:8], 0)   // ANCOUNT
+	binary.BigEndian.PutUint16(dnsMsg[8:10], 0)  // NSCOUNT
+	binary.BigEndian.PutUint16(dnsMsg[10:12], 0) // ARCOUNT
 
 	copy(dnsMsg[12:], payload)
 
-	encoded := base64.RawURLEncoding.EncodeToString(dnsMsg)
+	httpReq := &bytes.Buffer{}
+	fmt.Fprintf(httpReq, "POST /dns-query HTTP/2\r\n")
+	fmt.Fprintf(httpReq, "Host: dns.google\r\n")
+	fmt.Fprintf(httpReq, "Content-Type: application/dns-message\r\n")
+	fmt.Fprintf(httpReq, "Content-Length: %d\r\n", len(dnsMsg))
+	fmt.Fprintf(httpReq, "\r\n")
+	httpReq.Write(dnsMsg)
 
-	httpBody := []byte("{\"dns\":\"" + encoded + "\"}")
-
-	return httpBody
+	return httpReq.Bytes()
 }
+
+func (d *DNSOverHTTPSMask) Unwrap(data []byte) ([]byte, error) {
+	idx := bytes.Index(data, []byte("\r\n\r\n"))
+	if idx == -1 {
+		return nil, ErrInvalidPacket
+	}
+
+	body := data[idx+4:]
+	if len(body) < 12 {
+		return nil, ErrInvalidPacket
+	}
+
+	return body[12:], nil
+}
+
+func (d *DNSOverHTTPSMask) ID() string { return "doh" }

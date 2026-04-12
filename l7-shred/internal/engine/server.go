@@ -30,6 +30,5 @@ func (s *Server) Stop() error {
 	if s.inbound != nil {
 		return s.inbound.Stop()
 	}
-
 	return nil
 }

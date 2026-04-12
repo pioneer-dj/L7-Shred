@@ -1,21 +1,20 @@
 package transport
 
 import (
+	"io"
 	"net"
+	"time"
 
 	"github.com/l7-shred/core/internal/crypto"
-	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/shred"
 )
 
 type Outbound struct {
 	config     *Config
 	conn       net.Conn
-	packetConn net.PacketConn
+	packetConn net.Conn
 	session    *shred.Session
 	cipher     *crypto.AEADCipher
-	shredder   *engine.Shredder
-	serverAddr net.Addr
 }
 
 func NewOutbound(config *Config) (*Outbound, error) {
@@ -28,10 +27,9 @@ func NewOutbound(config *Config) (*Outbound, error) {
 	session := sessionMgr.CreateSession()
 
 	return &Outbound{
-		config:   config,
-		session:  session,
-		cipher:   cipher,
-		shredder: engine.NewShredder(session.ID, cipher),
+		config:  config,
+		session: session,
+		cipher:  cipher,
 	}, nil
 }
 
@@ -49,33 +47,61 @@ func (o *Outbound) connectTCP() error {
 	}
 	o.conn = conn
 
-	go o.shredder.Shred(conn, conn)
+	go o.tcpLoop()
+	go o.sendTestData()
 	return nil
 }
 
 func (o *Outbound) connectUDP() error {
-	packetConn, err := net.ListenPacket("udp", ":0")
+	conn, err := net.Dial("udp", o.config.ServerAddr)
 	if err != nil {
 		return err
 	}
-
-	serverAddr, err := net.ResolveUDPAddr("udp", o.config.ServerAddr)
-	if err != nil {
-		packetConn.Close()
-		return err
-	}
-
-	o.packetConn = packetConn
-	o.serverAddr = serverAddr
+	o.packetConn = conn
 
 	go o.udpLoop()
 	return nil
 }
 
+func (o *Outbound) sendTestData() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		testMsg := []byte("ping")
+		encrypted, err := o.cipher.Encrypt(testMsg)
+		if err != nil {
+			continue
+		}
+		o.conn.Write(encrypted)
+	}
+}
+
+func (o *Outbound) tcpLoop() {
+	buf := make([]byte, 65536)
+	for {
+		n, err := o.conn.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				return
+			}
+			return
+		}
+
+		decrypted, err := o.cipher.Decrypt(buf[:n])
+		if err != nil {
+			continue
+		}
+
+		o.session.BytesOut += uint64(len(decrypted))
+		println("Client received:", string(decrypted))
+	}
+}
+
 func (o *Outbound) udpLoop() {
 	buf := make([]byte, 65536)
 	for {
-		n, _, err := o.packetConn.ReadFrom(buf)
+		n, err := o.packetConn.Read(buf)
 		if err != nil {
 			return
 		}
@@ -85,20 +111,8 @@ func (o *Outbound) udpLoop() {
 			continue
 		}
 
-		sessionHeader := make([]byte, 8)
-		sessionHeader[0] = byte(o.session.ID >> 56)
-		sessionHeader[1] = byte(o.session.ID >> 48)
-		sessionHeader[2] = byte(o.session.ID >> 40)
-		sessionHeader[3] = byte(o.session.ID >> 32)
-		sessionHeader[4] = byte(o.session.ID >> 24)
-		sessionHeader[5] = byte(o.session.ID >> 16)
-		sessionHeader[6] = byte(o.session.ID >> 8)
-		sessionHeader[7] = byte(o.session.ID)
-
-		_, err = o.packetConn.WriteTo(append(sessionHeader, encrypted...), o.serverAddr)
-		if err != nil {
-			return
-		}
+		o.session.BytesOut += uint64(len(encrypted))
+		o.packetConn.Write(encrypted)
 	}
 }
 

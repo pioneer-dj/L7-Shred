@@ -5,17 +5,13 @@ import (
 )
 
 type Client struct {
-	config    *transport.Config
-	outbound  *transport.Outbound
-	scheduler *ChaffScheduler
+	config   *transport.Config
+	outbound *transport.Outbound
 }
 
 func NewClient(config *transport.Config) *Client {
-	scheduler := NewChaffScheduler(config.ChaffingInterval, config.ChaffTargets)
-
 	return &Client{
-		config:    config,
-		scheduler: scheduler,
+		config: config,
 	}
 }
 
@@ -27,25 +23,12 @@ func (c *Client) Start() error {
 
 	c.outbound = outbound
 
-	if err := c.outbound.Connect(); err != nil {
-		return err
-	}
-
-	if c.config.ChaffingEnabled {
-		c.scheduler.Start()
-	}
-
-	return nil
+	return c.outbound.Connect()
 }
 
 func (c *Client) Stop() error {
-	if c.scheduler != nil {
-		c.scheduler.Stop()
-	}
-
 	if c.outbound != nil {
 		return c.outbound.Close()
 	}
-
 	return nil
 }

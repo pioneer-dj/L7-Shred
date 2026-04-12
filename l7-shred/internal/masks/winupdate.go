@@ -39,6 +39,29 @@ func (w *WinUpdateMask) Wrap(payload []byte) []byte {
 	return buf
 }
 
+func (w *WinUpdateMask) Unwrap(data []byte) ([]byte, error) {
+	if len(data) < 18 {
+		return nil, ErrInvalidPacket
+	}
+
+	payloadLen := binary.BigEndian.Uint32(data[12:16])
+
+	if len(data) < 18+int(payloadLen) {
+		return nil, ErrInvalidPacket
+	}
+
+	payload := data[18 : 18+int(payloadLen)]
+
+	expectedCRC := binary.BigEndian.Uint16(data[16:18])
+	actualCRC := w.calcCRC(payload)
+
+	if expectedCRC != actualCRC {
+		return nil, ErrCorruptedData
+	}
+
+	return payload, nil
+}
+
 func (w *WinUpdateMask) calcCRC(data []byte) uint16 {
 	var crc uint16
 	for _, b := range data {
@@ -53,3 +76,5 @@ func (w *WinUpdateMask) calcCRC(data []byte) uint16 {
 	}
 	return crc
 }
+
+func (w *WinUpdateMask) ID() string { return "winupdate" }

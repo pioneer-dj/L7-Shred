@@ -8,14 +8,6 @@ import (
 	"github.com/l7-shred/core/internal/shred"
 )
 
-type Shredder struct {
-	fragmentor *shred.Fragmentor
-	jitter     *shred.TemporalJitter
-	shaper     *shred.TrafficShaper
-	cipher     *crypto.AEADCipher
-	sessionID  uint64
-}
-
 type Fragmentor struct {
 	minSize      int
 	maxSize      int
@@ -25,8 +17,9 @@ type Fragmentor struct {
 
 func NewFragmentor(minSize, maxSize int) *Fragmentor {
 	return &Fragmentor{
-		minSize: minSize,
-		maxSize: maxSize,
+		minSize:     minSize,
+		maxSize:     maxSize,
+		currentSize: minSize,
 	}
 }
 
@@ -37,15 +30,15 @@ func (f *Fragmentor) Fragment(data []byte) [][]byte {
 	remaining := data
 
 	for len(remaining) > 0 {
-		fragmentSize := f.currentSize
-		if fragmentSize > len(remaining) {
-			fragmentSize = len(remaining)
+		size := f.currentSize
+		if size > len(remaining) {
+			size = len(remaining)
 		}
 
-		fragment := make([]byte, fragmentSize)
-		copy(fragment, remaining[:fragmentSize])
+		fragment := make([]byte, size)
+		copy(fragment, remaining[:size])
 		fragments = append(fragments, fragment)
-		remaining = remaining[fragmentSize:]
+		remaining = remaining[size:]
 	}
 
 	return fragments
@@ -56,6 +49,14 @@ func (f *Fragmentor) rotateIfNeeded() {
 		f.currentSize = f.minSize + int(time.Now().UnixNano()%int64(f.maxSize-f.minSize))
 		f.lastRotation = time.Now()
 	}
+}
+
+type Shredder struct {
+	fragmentor *Fragmentor
+	jitter     *shred.TemporalJitter
+	shaper     *shred.TrafficShaper
+	cipher     *crypto.AEADCipher
+	sessionID  uint64
 }
 
 func NewShredder(sessionID uint64, cipher *crypto.AEADCipher) *Shredder {

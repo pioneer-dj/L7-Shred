@@ -1,10 +1,10 @@
 package transport
 
 import (
+	"io"
 	"net"
 
 	"github.com/l7-shred/core/internal/crypto"
-	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/shred"
 )
 
@@ -14,7 +14,6 @@ type Inbound struct {
 	packetConn net.PacketConn
 	sessionMgr *shred.SessionManager
 	cipher     *crypto.AEADCipher
-	mixer      *engine.ProtocolMixer
 }
 
 func NewInbound(config *Config) (*Inbound, error) {
@@ -27,7 +26,6 @@ func NewInbound(config *Config) (*Inbound, error) {
 		config:     config,
 		sessionMgr: shred.NewSessionManager(),
 		cipher:     cipher,
-		mixer:      engine.NewProtocolMixer(),
 	}, nil
 }
 
@@ -74,9 +72,33 @@ func (i *Inbound) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	session := i.sessionMgr.CreateSession()
-	shredder := engine.NewShredder(session.ID, i.cipher)
+	buf := make([]byte, 65536)
 
-	shredder.Shred(conn, conn)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				return
+			}
+			return
+		}
+
+		decrypted, err := i.cipher.Decrypt(buf[:n])
+		if err != nil {
+			conn.Write([]byte("decrypt error"))
+			continue
+		}
+
+		session.BytesIn += uint64(len(decrypted))
+
+		encrypted, err := i.cipher.Encrypt(decrypted)
+		if err != nil {
+			conn.Write(decrypted)
+			continue
+		}
+
+		conn.Write(encrypted)
+	}
 }
 
 func (i *Inbound) packetLoop() {
@@ -91,18 +113,18 @@ func (i *Inbound) packetLoop() {
 }
 
 func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
-	sessionID := uint64(data[0])<<56 | uint64(data[1])<<48 | uint64(data[2])<<40 | uint64(data[3])<<32
-	session := i.sessionMgr.GetSession(sessionID)
-	if session == nil {
-		return
-	}
-
-	decrypted, err := i.cipher.Decrypt(data[8:])
+	decrypted, err := i.cipher.Decrypt(data)
 	if err != nil {
 		return
 	}
 
-	i.packetConn.WriteTo(decrypted, addr)
+	encrypted, err := i.cipher.Encrypt(decrypted)
+	if err != nil {
+		i.packetConn.WriteTo(decrypted, addr)
+		return
+	}
+
+	i.packetConn.WriteTo(encrypted, addr)
 }
 
 func (i *Inbound) Stop() error {
