@@ -45,6 +45,15 @@ func main() {
 	}
 	log.Printf("Server listening on %s (mode: %s)", cfg.ListenAddr, cfg.Mode)
 
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			stats := server.GetStats()
+			log.Printf("Stats: connections=%d", stats["active_connections"])
+		}
+	}()
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 

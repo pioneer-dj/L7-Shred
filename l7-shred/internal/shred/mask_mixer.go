@@ -330,3 +330,9 @@ func (m *MaskMixer) SetSwitchInterval(interval time.Duration) {
 	defer m.unlock()
 	m.switchInterval = interval
 }
+
+func (m *MaskMixer) GetSwitchInterval() time.Duration {
+	m.lock()
+	defer m.unlock()
+	return m.switchInterval
+}

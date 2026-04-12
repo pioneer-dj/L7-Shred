@@ -29,6 +29,33 @@ type Config struct {
 	ChaffTargets     []string      `json:"chaffing_targets"`
 	SessionTimeout   int           `json:"session_timeout"`
 	MaxSessions      int           `json:"max_sessions"`
+
+	OnPacket func([]byte) `json:"-"`
+}
+
+func DefaultConfig() *Config {
+	return &Config{
+		ServerAddr:       "",
+		ListenAddr:       ":8443",
+		Mode:             "udp",
+		Protocol:         "udp",
+		Cipher:           "aes-256-gcm",
+		PostQuantum:      false,
+		MTU:              1400,
+		MultiThreading:   true,
+		PaddingEnabled:   true,
+		PaddingMin:       32,
+		PaddingMax:       288,
+		PaddingRotate:    5,
+		JitterEnabled:    true,
+		JitterMeanMs:     2,
+		JitterStdDevMs:   1,
+		JitterLossRate:   0.001,
+		ChaffingEnabled:  false,
+		ChaffingInterval: 1 * time.Second,
+		SessionTimeout:   300,
+		MaxSessions:      1000,
+	}
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -42,5 +69,28 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
+	if config.MTU == 0 {
+		config.MTU = 1400
+	}
+	if config.Cipher == "" {
+		config.Cipher = "aes-256-gcm"
+	}
+	if config.SessionTimeout == 0 {
+		config.SessionTimeout = 300
+	}
+	if config.MaxSessions == 0 {
+		config.MaxSessions = 1000
+	}
+
 	return &config, nil
+}
+
+func (c *Config) Validate() error {
+	if c.ListenAddr == "" && c.ServerAddr == "" {
+		return ErrMissingAddress
+	}
+	if c.MTU < 576 || c.MTU > 9000 {
+		return ErrInvalidMTU
+	}
+	return nil
 }

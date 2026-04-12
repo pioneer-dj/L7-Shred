@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/l7-shred/core/internal/engine"
+	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
 )
 
@@ -38,12 +39,44 @@ func main() {
 		log.Fatalf("Invalid config: %v", err)
 	}
 
-	client := engine.NewClient(cfg)
+	clientConfig := &engine.ClientConfig{
+		TransportConfig: &transport.Config{
+			ServerAddr: cfg.ServerAddr,
+			Protocol:   cfg.Protocol,
+		},
+		AuthKey:        cfg.SecretKey,
+		SwitchInterval: 5 * time.Minute,
+		Modes: []shred.ProtocolMode{
+			shred.ModeMinecraft,
+			shred.ModeWebRTC,
+			shred.ModeQUIC,
+			shred.ModeRuTube,
+		},
+		HandshakeTimeout:       10 * time.Second,
+		EnableReplayProtection: true,
+	}
+
+	client := engine.NewClient(clientConfig)
+
+	client.SetOnPacket(func(data []byte) {
+		log.Printf("Received packet from server: %d bytes", len(data))
+	})
 
 	if err := client.Start(); err != nil {
 		log.Fatalf("Failed to start client: %v", err)
 	}
 	log.Println("Client started successfully")
+	log.Printf("Connected to server: %s", cfg.ServerAddr)
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			stats := client.GetStats()
+			log.Printf("Stats: mode=%s, sent=%d, recv=%d",
+				stats["current_mode"], stats["packets_sent"], stats["packets_recv"])
+		}
+	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)

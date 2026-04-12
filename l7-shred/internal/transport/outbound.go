@@ -3,6 +3,7 @@ package transport
 import (
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/l7-shred/core/internal/crypto"
@@ -15,6 +16,8 @@ type Outbound struct {
 	packetConn net.Conn
 	session    *shred.Session
 	cipher     *crypto.AEADCipher
+
+	mu sync.RWMutex
 }
 
 func NewOutbound(config *Config) (*Outbound, error) {
@@ -124,4 +127,14 @@ func (o *Outbound) Close() error {
 		o.packetConn.Close()
 	}
 	return nil
+}
+
+func (o *Outbound) GetConn() net.Conn {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.conn
+}
+
+func (o *Outbound) Conn() net.Conn {
+	return o.conn
 }

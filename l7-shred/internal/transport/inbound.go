@@ -3,6 +3,8 @@ package transport
 import (
 	"io"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/l7-shred/core/internal/crypto"
 	"github.com/l7-shred/core/internal/shred"
@@ -14,6 +16,16 @@ type Inbound struct {
 	packetConn net.PacketConn
 	sessionMgr *shred.SessionManager
 	cipher     *crypto.AEADCipher
+	udpConns   map[string]*UDPConnWrapper
+	udpMu      sync.RWMutex
+}
+
+type UDPConnWrapper struct {
+	conn       net.PacketConn
+	remoteAddr net.Addr
+	readChan   chan []byte
+	closed     bool
+	mu         sync.RWMutex
 }
 
 func NewInbound(config *Config) (*Inbound, error) {
@@ -26,6 +38,7 @@ func NewInbound(config *Config) (*Inbound, error) {
 		config:     config,
 		sessionMgr: shred.NewSessionManager(),
 		cipher:     cipher,
+		udpConns:   make(map[string]*UDPConnWrapper),
 	}, nil
 }
 
@@ -85,7 +98,6 @@ func (i *Inbound) handleConnection(conn net.Conn) {
 
 		decrypted, err := i.cipher.Decrypt(buf[:n])
 		if err != nil {
-			conn.Write([]byte("decrypt error"))
 			continue
 		}
 
@@ -113,18 +125,67 @@ func (i *Inbound) packetLoop() {
 }
 
 func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
+	addrStr := addr.String()
+
+	i.udpMu.RLock()
+	wrapper, exists := i.udpConns[addrStr]
+	i.udpMu.RUnlock()
+
+	if !exists {
+		wrapper = &UDPConnWrapper{
+			conn:       i.packetConn,
+			remoteAddr: addr,
+			readChan:   make(chan []byte, 100),
+		}
+		i.udpMu.Lock()
+		i.udpConns[addrStr] = wrapper
+		i.udpMu.Unlock()
+	}
+
 	decrypted, err := i.cipher.Decrypt(data)
 	if err != nil {
 		return
 	}
 
-	encrypted, err := i.cipher.Encrypt(decrypted)
-	if err != nil {
-		i.packetConn.WriteTo(decrypted, addr)
-		return
+	select {
+	case wrapper.readChan <- decrypted:
+	default:
+	}
+}
+
+func (i *Inbound) Accept() (net.Conn, error) {
+	if i.listener != nil {
+		return i.listener.Accept()
 	}
 
-	i.packetConn.WriteTo(encrypted, addr)
+	if i.packetConn != nil {
+		return i.acceptUDP()
+	}
+
+	return nil, net.ErrClosed
+}
+
+func (i *Inbound) acceptUDP() (net.Conn, error) {
+	for {
+		i.udpMu.RLock()
+		for addrStr, wrapper := range i.udpConns {
+			select {
+			case data := <-wrapper.readChan:
+				i.udpMu.RUnlock()
+				return &UDPConn{
+					wrapper:    wrapper,
+					remoteAddr: wrapper.remoteAddr,
+					localAddr:  i.packetConn.LocalAddr(),
+					readData:   data,
+				}, nil
+			default:
+			}
+			_ = addrStr
+		}
+		i.udpMu.RUnlock()
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (i *Inbound) Stop() error {
@@ -134,5 +195,91 @@ func (i *Inbound) Stop() error {
 	if i.packetConn != nil {
 		i.packetConn.Close()
 	}
+
+	i.udpMu.Lock()
+	for _, wrapper := range i.udpConns {
+		wrapper.mu.Lock()
+		wrapper.closed = true
+		close(wrapper.readChan)
+		wrapper.mu.Unlock()
+	}
+	i.udpConns = make(map[string]*UDPConnWrapper)
+	i.udpMu.Unlock()
+
+	return nil
+}
+
+type UDPConn struct {
+	wrapper    *UDPConnWrapper
+	remoteAddr net.Addr
+	localAddr  net.Addr
+	readData   []byte
+	readBuffer []byte
+	closed     bool
+	mu         sync.RWMutex
+}
+
+func (u *UDPConn) Read(b []byte) (int, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.closed {
+		return 0, net.ErrClosed
+	}
+
+	if u.readData != nil {
+		n := copy(b, u.readData)
+		u.readData = nil
+		return n, nil
+	}
+
+	select {
+	case data, ok := <-u.wrapper.readChan:
+		if !ok {
+			return 0, net.ErrClosed
+		}
+		n := copy(b, data)
+		if len(data) > n {
+			u.readData = data[n:]
+		}
+		return n, nil
+	}
+}
+
+func (u *UDPConn) Write(b []byte) (int, error) {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	if u.closed {
+		return 0, net.ErrClosed
+	}
+
+	return u.wrapper.conn.WriteTo(b, u.remoteAddr)
+}
+
+func (u *UDPConn) Close() error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.closed = true
+	return nil
+}
+
+func (u *UDPConn) LocalAddr() net.Addr {
+	return u.localAddr
+}
+
+func (u *UDPConn) RemoteAddr() net.Addr {
+	return u.remoteAddr
+}
+
+func (u *UDPConn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (u *UDPConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (u *UDPConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
