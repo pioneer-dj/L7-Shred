@@ -11,7 +11,7 @@ type Config struct {
 	ListenAddr       string        `json:"listen"`
 	Mode             string        `json:"mode"`
 	Protocol         string        `json:"protocol"`
-	SecretKey        []byte        `json:"secret_key"`
+	SecretKey        string        `json:"secret_key"`
 	Cipher           string        `json:"cipher"`
 	PostQuantum      bool          `json:"post_quantum"`
 	MTU              int           `json:"mtu"`
@@ -94,3 +94,8 @@ func (c *Config) Validate() error {
 	}
 	return nil
 }
+
+func (c *Config) GetSecretKey() []byte {
+	return []byte(c.SecretKey)
+}
+

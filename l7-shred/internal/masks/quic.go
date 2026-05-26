@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
+	"time"
 )
 
 type QUICMask struct {
@@ -21,11 +22,15 @@ type QUICMask struct {
 	oneRTTSecret    []byte
 	transportParams []byte
 	connectionID    [20]byte
+	scid            []byte
+	dcid            []byte
 }
 
 func NewQUICMask() *QUICMask {
 	destID := make([]byte, 8)
 	srcID := make([]byte, 8)
+	scid := make([]byte, 8)
+	dcid := make([]byte, 8)
 	initialSecret := make([]byte, 32)
 	handshakeSecret := make([]byte, 32)
 	oneRTTSecret := make([]byte, 32)
@@ -33,6 +38,8 @@ func NewQUICMask() *QUICMask {
 
 	rand.Read(destID)
 	rand.Read(srcID)
+	rand.Read(scid)
+	rand.Read(dcid)
 	rand.Read(initialSecret)
 	rand.Read(handshakeSecret)
 	rand.Read(oneRTTSecret)
@@ -53,6 +60,8 @@ func NewQUICMask() *QUICMask {
 	return &QUICMask{
 		destConnID:      destID,
 		srcConnID:       srcID,
+		scid:            scid,
+		dcid:            dcid,
 		version:         0x00000001,
 		packetNum:       0,
 		packetNumCipher: aead,
@@ -124,7 +133,8 @@ func (q *QUICMask) simulateInitialPacket() []byte {
 
 	cryptoFrame := make([]byte, 100)
 	cryptoFrame[0] = 0x06
-	rand.Read(cryptoFrame[1:])
+	binary.BigEndian.PutUint64(cryptoFrame[1:9], uint64(time.Now().UnixNano()))
+	rand.Read(cryptoFrame[9:])
 	copy(buf[offset:offset+len(cryptoFrame)], cryptoFrame)
 
 	q.packetNum++

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -24,16 +25,23 @@ type Client struct {
 	authKey      []byte
 	connected    bool
 	mu           sync.RWMutex
+	writeMu      sync.Mutex
 	packetsSent  uint64
 	packetsRecv  uint64
 	bytesSent    uint64
 	bytesRecv    uint64
 	onPacket     func([]byte)
+
+	handshakeChan chan []byte
+	handshakeErr  chan error
+	handshakeDone bool
+	tunAdded      bool
 }
 
 type ClientConfig struct {
 	TransportConfig        *transport.Config
 	AuthKey                []byte
+	Cipher                 string
 	SwitchInterval         time.Duration
 	Modes                  []shred.ProtocolMode
 	HandshakeTimeout       time.Duration
@@ -47,7 +55,7 @@ func DefaultClientConfig(serverAddr string) *ClientConfig {
 	return &ClientConfig{
 		TransportConfig: &transport.Config{
 			ServerAddr: serverAddr,
-			Protocol:   "udp",
+			Protocol:   "tcp",
 		},
 		AuthKey:        authKey,
 		SwitchInterval: 5 * time.Minute,
@@ -67,6 +75,24 @@ func NewClient(config *ClientConfig) *Client {
 		config = DefaultClientConfig("")
 	}
 
+	if config.Cipher == "" {
+		config.Cipher = "aes-256-gcm"
+	}
+
+	if config.TransportConfig == nil {
+		config.TransportConfig = &transport.Config{}
+	}
+	config.TransportConfig.Cipher = config.Cipher
+	config.TransportConfig.SecretKey = string(config.AuthKey)
+
+	log.Printf("[DEBUG] AuthKey length: %d", len(config.AuthKey))
+	log.Printf("[DEBUG] Cipher: %s", config.Cipher)
+
+	if len(config.AuthKey) == 0 {
+		log.Printf("[ERROR] AuthKey is empty! Cannot start client.")
+		return nil
+	}
+
 	sessionMgr := shred.NewSessionManager()
 	session := sessionMgr.CreateSessionWithConfig(&shred.SessionConfig{
 		SwitchInterval:         config.SwitchInterval,
@@ -81,13 +107,17 @@ func NewClient(config *ClientConfig) *Client {
 	handshakeMgr := shred.NewHandshakeManager(config.AuthKey, config.HandshakeTimeout)
 
 	return &Client{
-		config:       config.TransportConfig,
-		session:      session,
-		sessionMgr:   sessionMgr,
-		handshakeMgr: handshakeMgr,
-		mixer:        mixer,
-		stopChan:     make(chan struct{}),
-		authKey:      config.AuthKey,
+		config:        config.TransportConfig,
+		session:       session,
+		sessionMgr:    sessionMgr,
+		handshakeMgr:  handshakeMgr,
+		mixer:         mixer,
+		stopChan:      make(chan struct{}),
+		authKey:       config.AuthKey,
+		handshakeChan: make(chan []byte, 10),
+		handshakeErr:  make(chan error, 1),
+		handshakeDone: false,
+		tunAdded:      false,
 	}
 }
 
@@ -103,24 +133,30 @@ func (c *Client) Start() error {
 
 	outbound, err := transport.NewOutbound(c.config)
 	if err != nil {
+		log.Printf("[Client] NewOutbound error: %v", err)
 		return err
 	}
 
 	c.outbound = outbound
 
+	log.Printf("[Client] Outbound created, calling Connect()")
 	if err := c.outbound.Connect(); err != nil {
+		log.Printf("[Client] Connect error: %v", err)
 		return err
 	}
+	log.Printf("[Client] Connect() successful")
+
+	c.wg.Add(1)
+	go c.readLoop()
 
 	if err := c.performHandshake(); err != nil {
+		log.Printf("[Client] performHandshake error: %v", err)
 		c.outbound.Close()
 		return err
 	}
 
 	c.connected = true
-
-	c.wg.Add(1)
-	go c.readLoop()
+	c.handshakeDone = true
 
 	log.Printf("[Client] Connected successfully, using mode: %s", c.mixer.GetCurrentMode().String())
 
@@ -132,10 +168,24 @@ func (c *Client) performHandshake() error {
 
 	conn := c.getConn()
 	if conn == nil {
+		log.Printf("[Client] getConn returned nil")
 		return net.ErrClosed
 	}
+	log.Printf("[Client] Got connection, local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 
-	err := c.handshakeMgr.PerformClientHandshake(conn, c.mixer.GetSwitchInterval(), c.mixer.GetModes())
+	timeout := 10 * time.Second
+	if c.config.SessionTimeout > 0 {
+		timeout = time.Duration(c.config.SessionTimeout) * time.Second
+	}
+
+	err := c.handshakeMgr.PerformClientHandshakeAsync(
+		conn,
+		c.mixer.GetSwitchInterval(),
+		c.mixer.GetModes(),
+		c.handshakeChan,
+		c.handshakeErr,
+		timeout,
+	)
 	if err != nil {
 		log.Printf("[Client] Handshake failed: %v", err)
 		return err
@@ -151,29 +201,57 @@ func (c *Client) performHandshake() error {
 
 func (c *Client) getConn() net.Conn {
 	if c.outbound == nil {
+		log.Printf("[Client] getConn: outbound is nil")
 		return nil
 	}
-	return c.outbound.Conn()
+	conn := c.outbound.Conn()
+	if conn == nil {
+		log.Printf("[Client] getConn: outbound.Conn() returned nil")
+	}
+	return conn
 }
 
 func (c *Client) readLoop() {
 	defer c.wg.Done()
+	log.Printf("[Client] readLoop started")
 
 	buf := make([]byte, 65536)
 
 	for {
 		select {
 		case <-c.stopChan:
+			log.Printf("[Client] readLoop: stop signal received")
 			return
 		default:
 		}
 
 		conn := c.getConn()
 		if conn == nil {
+			log.Printf("[Client] readLoop: conn is nil, exiting")
 			return
 		}
 
-		n, err := conn.Read(buf)
+		if !c.handshakeDone {
+			n, err := conn.Read(buf)
+			if err != nil {
+				if c.connected {
+					log.Printf("[Client] Read error: %v", err)
+				}
+				return
+			}
+			data := make([]byte, n)
+			copy(data, buf[:n])
+
+			select {
+			case c.handshakeChan <- data:
+				log.Printf("[Client] readLoop: sent %d bytes to handshake channel", n)
+			default:
+				log.Printf("[Client] readLoop: handshake channel full, dropping data")
+			}
+			continue
+		}
+
+		frame, err := readFrame(conn, buf)
 		if err != nil {
 			if c.connected {
 				log.Printf("[Client] Read error: %v", err)
@@ -183,10 +261,10 @@ func (c *Client) readLoop() {
 
 		c.mu.Lock()
 		c.packetsRecv++
-		c.bytesRecv += uint64(n)
+		c.bytesRecv += uint64(len(frame))
 		c.mu.Unlock()
 
-		go c.processIncomingPacket(buf[:n])
+		go c.processIncomingPacket(frame)
 	}
 }
 
@@ -227,8 +305,9 @@ func (c *Client) Send(payload []byte) error {
 		return net.ErrClosed
 	}
 
-	_, err := conn.Write(wrapped)
-	return err
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return writeFrame(conn, wrapped)
 }
 
 func (c *Client) SendTo(writer io.Writer, payload []byte) error {
@@ -261,6 +340,12 @@ func (c *Client) Stop() error {
 		return nil
 	}
 
+	if c.tunAdded {
+		cmd := exec.Command("route", "delete", "0.0.0.0")
+		cmd.Run()
+		log.Printf("[Client] Removed default route")
+	}
+
 	log.Printf("[Client] Stopping client...")
 
 	close(c.stopChan)
@@ -271,6 +356,7 @@ func (c *Client) Stop() error {
 	}
 
 	c.connected = false
+	c.handshakeDone = false
 
 	log.Printf("[Client] Stopped. Stats: sent=%d packets (%d bytes), recv=%d packets (%d bytes)",
 		c.packetsSent, c.bytesSent, c.packetsRecv, c.bytesRecv)
@@ -327,4 +413,10 @@ func (c *Client) SetSwitchInterval(interval time.Duration) {
 
 func (c *Client) GetAuthKey() []byte {
 	return c.authKey
+}
+
+func (c *Client) SetTunAdded(added bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tunAdded = added
 }

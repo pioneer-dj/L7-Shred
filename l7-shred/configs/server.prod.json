@@ -1,0 +1,17 @@
+{
+    "listen": "0.0.0.0:8443",
+    "mode": "udp",
+    "protocol": "udp",
+    "secret_key": "UaCzuL7RNhX8mIjStJdF50iOwPybVB4A",
+    "cipher": "aes-256-gcm",
+    "mtu": 1400,
+    "padding_enabled": true,
+    "padding_min": 32,
+    "padding_max": 288,
+    "jitter_enabled": true,
+    "jitter_mean_ms": 2,
+    "jitter_stddev_ms": 1,
+    "jitter_loss_rate": 0.001,
+    "session_timeout": 300,
+    "max_sessions": 1000
+}

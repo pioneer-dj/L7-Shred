@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -245,6 +246,11 @@ type HandshakeManager struct {
 }
 
 func NewHandshakeManager(authKey []byte, timeout time.Duration) *HandshakeManager {
+	log.Printf("[Handshake] NewHandshakeManager: authKey length = %d", len(authKey))
+	if len(authKey) > 0 {
+		log.Printf("[Handshake] NewHandshakeManager: authKey first 5 bytes = %x", authKey[:5])
+	}
+
 	return &HandshakeManager{
 		state:   NewHandshakeState(),
 		authKey: authKey,
@@ -252,75 +258,200 @@ func NewHandshakeManager(authKey []byte, timeout time.Duration) *HandshakeManage
 	}
 }
 
-func (hm *HandshakeManager) PerformClientHandshake(conn net.Conn, interval time.Duration, modes []ProtocolMode) error {
+func (hm *HandshakeManager) PerformClientHandshakeAsync(conn net.Conn, interval time.Duration, modes []ProtocolMode, readChan <-chan []byte, errChan chan error, timeout time.Duration) error {
+	log.Printf("[Handshake] ========== CLIENT HANDSHAKE ASYNC START ==========")
+	log.Printf("[Handshake] Connection: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
+	log.Printf("[Handshake] Interval: %v, Modes: %v", interval, modes)
+
 	seq := hm.state.NextSequence()
+	log.Printf("[Handshake] Using sequence: %d", seq)
 
 	syn := NewHandshake(HandshakeSyn, interval, modes, seq)
 	synData := syn.Encode()
+	log.Printf("[Handshake] SynData length: %d", len(synData))
 
 	signature := hm.sign(synData)
-	synData = append(synData, signature...)
+	log.Printf("[Handshake] Signature length: %d", len(signature))
+
+	packet := append(synData, signature...)
+	log.Printf("[Handshake] Total packet length: %d", len(packet))
+
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		log.Printf("[Handshake] SetWriteDeadline error: %v", err)
+		return err
+	}
+
+	log.Printf("[Handshake] Sending SYN to server...")
+	n, err := conn.Write(packet)
+	if err != nil {
+		log.Printf("[Handshake] Write error: %v", err)
+		return err
+	}
+	log.Printf("[Handshake] Wrote %d bytes", n)
+
+	log.Printf("[Handshake] Waiting for ACK via channel (timeout: %v)", timeout)
+
+	select {
+	case ackData := <-readChan:
+		log.Printf("[Handshake] Received %d bytes from channel", len(ackData))
+
+		if len(ackData) < 32 {
+			log.Printf("[Handshake] Response too short: %d bytes", len(ackData))
+			return ErrAuthFailed
+		}
+
+		ackPayload := ackData[:len(ackData)-32]
+		ackSignature := ackData[len(ackData)-32:]
+
+		if !hm.verify(ackPayload, ackSignature) {
+			log.Printf("[Handshake] ACK signature verification failed")
+			return ErrAuthFailed
+		}
+		log.Printf("[Handshake] ACK signature verified")
+
+		ack, err := DecodeHandshake(ackPayload)
+		if err != nil {
+			log.Printf("[Handshake] Decode error: %v", err)
+			return err
+		}
+		log.Printf("[Handshake] ACK decoded: Type=%d, Sequence=%d", ack.Type, ack.Sequence)
+
+		if ack.Type != HandshakeAck {
+			log.Printf("[Handshake] Wrong response type: %d, expected %d", ack.Type, HandshakeAck)
+			return ErrAuthFailed
+		}
+
+		if hm.state.IsReplay(ack.Sequence, 30*time.Second) {
+			log.Printf("[Handshake] Replay detected for sequence %d", ack.Sequence)
+			return ErrHandshakeReplay
+		}
+
+		hm.state.MarkSeen(ack.Sequence)
+		conn.SetWriteDeadline(time.Time{})
+		conn.SetReadDeadline(time.Time{})
+		log.Printf("[Handshake] ========== CLIENT HANDSHAKE SUCCESS ==========")
+		return nil
+
+	case err := <-errChan:
+		log.Printf("[Handshake] Error from channel: %v", err)
+		return err
+
+	case <-time.After(timeout):
+		log.Printf("[Handshake] Timeout waiting for ACK")
+		return ErrHandshakeTimeout
+	}
+}
+
+func (hm *HandshakeManager) PerformClientHandshake(conn net.Conn, interval time.Duration, modes []ProtocolMode) error {
+	log.Printf("[Handshake] ========== CLIENT HANDSHAKE START ==========")
+	log.Printf("[Handshake] Connection: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
+	log.Printf("[Handshake] Interval: %v, Modes: %v", interval, modes)
+
+	seq := hm.state.NextSequence()
+	log.Printf("[Handshake] Using sequence: %d", seq)
+
+	syn := NewHandshake(HandshakeSyn, interval, modes, seq)
+	synData := syn.Encode()
+	log.Printf("[Handshake] SynData length: %d", len(synData))
+
+	signature := hm.sign(synData)
+	log.Printf("[Handshake] Signature length: %d", len(signature))
+
+	packet := append(synData, signature...)
+	log.Printf("[Handshake] Total packet length: %d", len(packet))
 
 	if err := conn.SetWriteDeadline(time.Now().Add(hm.timeout)); err != nil {
+		log.Printf("[Handshake] SetWriteDeadline error: %v", err)
 		return err
 	}
 
-	if _, err := conn.Write(synData); err != nil {
+	log.Printf("[Handshake] Sending SYN to server...")
+	n, err := conn.Write(packet)
+	if err != nil {
+		log.Printf("[Handshake] Write error: %v", err)
 		return err
 	}
+	log.Printf("[Handshake] Wrote %d bytes", n)
 
 	if err := conn.SetReadDeadline(time.Now().Add(hm.timeout)); err != nil {
+		log.Printf("[Handshake] SetReadDeadline error: %v", err)
 		return err
 	}
 
+	log.Printf("[Handshake] Waiting for ACK from server...")
 	ackBuf := make([]byte, 4096)
-	n, err := conn.Read(ackBuf)
+	n, err = conn.Read(ackBuf)
 	if err != nil {
+		log.Printf("[Handshake] Read error: %v", err)
+		log.Printf("[Handshake] Connection state after error: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 		return err
 	}
+
+	log.Printf("[Handshake] Received %d bytes", n)
+	log.Printf("[Handshake] First 20 bytes: %x", ackBuf[:min(n, 20)])
 
 	if n < 32 {
+		log.Printf("[Handshake] Response too short: %d bytes", n)
 		return ErrAuthFailed
 	}
 
 	ackData := ackBuf[:n-32]
 	ackSignature := ackBuf[n-32 : n]
+	log.Printf("[Handshake] ACK data length: %d, signature length: %d", len(ackData), len(ackSignature))
 
 	if !hm.verify(ackData, ackSignature) {
+		log.Printf("[Handshake] ACK signature verification failed")
 		return ErrAuthFailed
 	}
+	log.Printf("[Handshake] ACK signature verified")
 
 	ack, err := DecodeHandshake(ackData)
 	if err != nil {
+		log.Printf("[Handshake] Decode error: %v", err)
 		return err
 	}
+	log.Printf("[Handshake] ACK decoded: Type=%d, Sequence=%d", ack.Type, ack.Sequence)
 
 	if ack.Type != HandshakeAck {
+		log.Printf("[Handshake] Wrong response type: %d, expected %d", ack.Type, HandshakeAck)
 		return ErrAuthFailed
 	}
 
 	if hm.state.IsReplay(ack.Sequence, 30*time.Second) {
+		log.Printf("[Handshake] Replay detected for sequence %d", ack.Sequence)
 		return ErrHandshakeReplay
 	}
 
 	hm.state.MarkSeen(ack.Sequence)
+	conn.SetWriteDeadline(time.Time{})
+	conn.SetReadDeadline(time.Time{})
+	log.Printf("[Handshake] ========== CLIENT HANDSHAKE SUCCESS ==========")
 
 	return nil
 }
 
 func (hm *HandshakeManager) PerformServerHandshake(conn net.Conn) (*SessionConfig, error) {
-	buf := make([]byte, 4096)
+	log.Printf("[Handshake] ========== SERVER HANDSHAKE START ==========")
+	log.Printf("[Handshake] Connection: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 
+	buf := make([]byte, 4096)
 	if err := conn.SetReadDeadline(time.Now().Add(hm.timeout)); err != nil {
+		log.Printf("[Handshake] SetReadDeadline error: %v", err)
 		return nil, err
 	}
 
+	log.Printf("[Handshake] Waiting for SYN from client...")
 	n, err := conn.Read(buf)
 	if err != nil {
+		log.Printf("[Handshake] Read error: %v", err)
 		return nil, err
 	}
 
+	log.Printf("[Handshake] Received %d bytes", n)
+	log.Printf("[Handshake] First 20 bytes: %x", buf[:min(n, 20)])
+
 	if n < 32 {
+		log.Printf("[Handshake] Data too short: %d bytes", n)
 		return nil, ErrAuthFailed
 	}
 
@@ -328,27 +459,37 @@ func (hm *HandshakeManager) PerformServerHandshake(conn net.Conn) (*SessionConfi
 	signature := buf[n-32 : n]
 
 	if !hm.verify(synData, signature) {
+		log.Printf("[Handshake] SYN signature verification failed")
 		return nil, ErrAuthFailed
 	}
+	log.Printf("[Handshake] SYN signature verified")
 
 	syn, err := DecodeHandshake(synData)
 	if err != nil {
+		log.Printf("[Handshake] Decode error: %v", err)
 		return nil, err
 	}
 
+	log.Printf("[Handshake] SYN decoded: Type=%d, Interval=%d, Modes=%v, Sequence=%d",
+		syn.Type, syn.SwitchInterval, syn.Modes, syn.Sequence)
+
 	if syn.Type != HandshakeSyn {
+		log.Printf("[Handshake] Wrong handshake type: %d, expected %d", syn.Type, HandshakeSyn)
 		return nil, ErrAuthFailed
 	}
 
 	if hm.state.IsReplay(syn.Sequence, 30*time.Second) {
+		log.Printf("[Handshake] Replay detected for sequence %d", syn.Sequence)
 		return nil, ErrHandshakeReplay
 	}
 
 	hm.state.MarkSeen(syn.Sequence)
 
 	config := &SessionConfig{
-		SwitchInterval: time.Duration(syn.SwitchInterval) * time.Second,
-		Modes:          syn.Modes,
+		SwitchInterval:         time.Duration(syn.SwitchInterval) * time.Second,
+		Modes:                  syn.Modes,
+		EnableReplayProtection: true,
+		ReplayWindowSize:       64,
 	}
 
 	seq := hm.state.NextSequence()
@@ -356,15 +497,36 @@ func (hm *HandshakeManager) PerformServerHandshake(conn net.Conn) (*SessionConfi
 	ackData := ack.Encode()
 	ackSignature := hm.sign(ackData)
 
+	log.Printf("[Handshake] Sending ACK, sequence=%d, length=%d", seq, len(ackData)+len(ackSignature))
+
 	if err := conn.SetWriteDeadline(time.Now().Add(hm.timeout)); err != nil {
+		log.Printf("[Handshake] SetWriteDeadline error: %v", err)
 		return nil, err
 	}
 
-	if _, err := conn.Write(append(ackData, ackSignature...)); err != nil {
+	n, err = conn.Write(append(ackData, ackSignature...))
+	if err != nil {
+		log.Printf("[Handshake] Write error: %v", err)
 		return nil, err
 	}
+	log.Printf("[Handshake] Wrote %d bytes ACK", n)
 
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
+	conn.SetWriteDeadline(time.Time{})
+	conn.SetReadDeadline(time.Time{})
+
+	log.Printf("[Handshake] ========== SERVER HANDSHAKE SUCCESS ==========")
 	return config, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (hm *HandshakeManager) sign(data []byte) []byte {

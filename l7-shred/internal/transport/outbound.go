@@ -1,10 +1,8 @@
 package transport
 
 import (
-	"io"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/l7-shred/core/internal/crypto"
 	"github.com/l7-shred/core/internal/shred"
@@ -16,12 +14,12 @@ type Outbound struct {
 	packetConn net.Conn
 	session    *shred.Session
 	cipher     *crypto.AEADCipher
-
-	mu sync.RWMutex
+	mu         sync.RWMutex
 }
 
 func NewOutbound(config *Config) (*Outbound, error) {
-	cipher, err := crypto.NewAEADCipher(config.SecretKey)
+	secretKeyBytes := []byte(config.SecretKey)
+	cipher, err := crypto.NewAEADCipher(secretKeyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -49,9 +47,6 @@ func (o *Outbound) connectTCP() error {
 		return err
 	}
 	o.conn = conn
-
-	go o.tcpLoop()
-	go o.sendTestData()
 	return nil
 }
 
@@ -61,62 +56,17 @@ func (o *Outbound) connectUDP() error {
 		return err
 	}
 	o.packetConn = conn
-
-	go o.udpLoop()
 	return nil
 }
 
-func (o *Outbound) sendTestData() {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		testMsg := []byte("ping")
-		encrypted, err := o.cipher.Encrypt(testMsg)
-		if err != nil {
-			continue
-		}
-		o.conn.Write(encrypted)
+func (o *Outbound) Write(data []byte) (int, error) {
+	if o.conn != nil {
+		return o.conn.Write(data)
 	}
-}
-
-func (o *Outbound) tcpLoop() {
-	buf := make([]byte, 65536)
-	for {
-		n, err := o.conn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				return
-			}
-			return
-		}
-
-		decrypted, err := o.cipher.Decrypt(buf[:n])
-		if err != nil {
-			continue
-		}
-
-		o.session.BytesOut += uint64(len(decrypted))
-		println("Client received:", string(decrypted))
+	if o.packetConn != nil {
+		return o.packetConn.Write(data)
 	}
-}
-
-func (o *Outbound) udpLoop() {
-	buf := make([]byte, 65536)
-	for {
-		n, err := o.packetConn.Read(buf)
-		if err != nil {
-			return
-		}
-
-		encrypted, err := o.cipher.Encrypt(buf[:n])
-		if err != nil {
-			continue
-		}
-
-		o.session.BytesOut += uint64(len(encrypted))
-		o.packetConn.Write(encrypted)
-	}
+	return 0, net.ErrClosed
 }
 
 func (o *Outbound) Close() error {
@@ -129,12 +79,12 @@ func (o *Outbound) Close() error {
 	return nil
 }
 
-func (o *Outbound) GetConn() net.Conn {
+func (o *Outbound) Conn() net.Conn {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	return o.conn
+	if o.conn != nil {
+		return o.conn
+	}
+	return o.packetConn
 }
 
-func (o *Outbound) Conn() net.Conn {
-	return o.conn
-}

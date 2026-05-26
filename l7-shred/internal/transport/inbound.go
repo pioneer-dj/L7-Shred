@@ -29,17 +29,18 @@ type UDPConnWrapper struct {
 }
 
 func NewInbound(config *Config) (*Inbound, error) {
-	cipher, err := crypto.NewAEADCipher(config.SecretKey)
-	if err != nil {
-		return nil, err
-	}
+    secretKeyBytes := []byte(config.SecretKey)
+    cipher, err := crypto.NewAEADCipher(secretKeyBytes)
+    if err != nil {
+        return nil, err
+    }
 
-	return &Inbound{
-		config:     config,
-		sessionMgr: shred.NewSessionManager(),
-		cipher:     cipher,
-		udpConns:   make(map[string]*UDPConnWrapper),
-	}, nil
+    return &Inbound{
+        config:     config,
+        sessionMgr: shred.NewSessionManager(),
+        cipher:     cipher,
+        udpConns:   make(map[string]*UDPConnWrapper),
+    }, nil
 }
 
 func (i *Inbound) Start() error {
@@ -283,3 +284,4 @@ func (u *UDPConn) SetReadDeadline(t time.Time) error {
 func (u *UDPConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
+

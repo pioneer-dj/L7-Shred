@@ -9,6 +9,7 @@ import (
 
 	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
+	"github.com/l7-shred/core/internal/tun"
 )
 
 type Server struct {
@@ -21,6 +22,7 @@ type Server struct {
 	mu             sync.RWMutex
 	logger         *log.Logger
 	stopChan       chan struct{}
+	tunDev         *tun.TunDevice
 }
 
 type ServerConnection struct {
@@ -32,12 +34,13 @@ type ServerConnection struct {
 	BytesIn   uint64
 	BytesOut  uint64
 	mu        sync.RWMutex
+	writeMu   sync.Mutex
 }
 
 func NewServer(config *transport.Config) *Server {
 	authKey := make([]byte, 32)
 	if len(config.SecretKey) > 0 {
-		authKey = config.SecretKey
+		authKey = []byte(config.SecretKey)
 	} else {
 		rand.Read(authKey)
 	}
@@ -58,6 +61,15 @@ func (s *Server) SetLogger(logger *log.Logger) {
 }
 
 func (s *Server) Start() error {
+	tunDev, err := tun.NewTunDevice()
+	if err != nil {
+		s.logger.Printf("Failed to create TUN device: %v", err)
+	} else {
+		s.tunDev = tunDev
+		s.logger.Printf("TUN device created")
+		go s.tunLoop()
+	}
+
 	inbound, err := transport.NewInbound(s.config)
 	if err != nil {
 		return err
@@ -70,6 +82,42 @@ func (s *Server) Start() error {
 
 	s.logger.Printf("Server started on %s", s.config.ListenAddr)
 	return s.inbound.Start()
+}
+
+func (s *Server) tunLoop() {
+	s.logger.Printf("tunLoop started")
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		default:
+		}
+
+		data, err := s.tunDev.Read()
+		if err != nil {
+			s.logger.Printf("TUN read error: %v", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if len(data) == 0 {
+			continue
+		}
+		s.logger.Printf("TUN read %d bytes", len(data))
+
+		s.mu.RLock()
+		for _, sc := range s.connections {
+			wrapped := sc.Session.Wrap(data)
+			sc.writeMu.Lock()
+			err := writeFrame(sc.Conn, wrapped)
+			sc.writeMu.Unlock()
+			if err != nil {
+				s.logger.Printf("Failed to write to client %d: %v", sc.ID, err)
+			} else {
+				s.logger.Printf("Successfully sent to client %d (%d bytes)", sc.ID, len(wrapped))
+			}
+		}
+		s.mu.RUnlock()
+	}
 }
 
 func (s *Server) acceptLoop() {
@@ -130,7 +178,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) handleDataExchange(sc *ServerConnection) {
-	buf := make([]byte, 65536)
+	scratch := make([]byte, 65536)
 
 	for {
 		select {
@@ -141,7 +189,7 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 
 		sc.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-		n, err := sc.Conn.Read(buf)
+		data, err := readFrame(sc.Conn, scratch)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
@@ -150,10 +198,8 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 			return
 		}
 
-		data := buf[:n]
-
 		sc.mu.Lock()
-		sc.BytesIn += uint64(n)
+		sc.BytesIn += uint64(len(data))
 		sc.LastSeen = time.Now()
 		sc.mu.Unlock()
 
@@ -165,8 +211,27 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 			continue
 		}
 
-		if len(unwrapped) > 0 {
-			s.logger.Printf("Received %d bytes from session %d", len(unwrapped), sc.ID)
+		if len(unwrapped) < 20 {
+			s.logger.Printf("Skip short packet: %d bytes from session %d", len(unwrapped), sc.ID)
+			continue
+		}
+
+		version := unwrapped[0] >> 4
+		proto := unwrapped[9]
+		srcIP := net.IP(unwrapped[12:16])
+		dstIP := net.IP(unwrapped[16:20])
+
+		s.logger.Printf("📦 Packet: version=%d, len=%d, proto=%d, src=%s, dst=%s",
+			version, len(unwrapped), proto, srcIP.String(), dstIP.String())
+
+		if s.tunDev != nil {
+			if err := s.tunDev.Write(unwrapped); err != nil {
+				s.logger.Printf("TUN write error: %v", err)
+			} else {
+				s.logger.Printf("✅ TUN write OK: %d bytes", len(unwrapped))
+			}
+		} else {
+			s.logger.Printf("TUN device is nil, cannot write")
 		}
 	}
 }
@@ -182,12 +247,14 @@ func (s *Server) SendToSession(sessionID uint64, data []byte) error {
 
 	wrapped := sc.Session.Wrap(data)
 
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.writeMu.Lock()
+	err := writeFrame(sc.Conn, wrapped)
+	sc.writeMu.Unlock()
 
+	sc.mu.Lock()
 	sc.BytesOut += uint64(len(wrapped))
 	sc.LastSeen = time.Now()
-	_, err := sc.Conn.Write(wrapped)
+	sc.mu.Unlock()
 	return err
 }
 
@@ -330,8 +397,13 @@ func (s *Server) Stop() error {
 	}
 
 	if s.inbound != nil {
-		return s.inbound.Stop()
+		s.inbound.Stop()
 	}
+
+	if s.tunDev != nil {
+		s.tunDev.Close()
+	}
+
 	return nil
 }
 
