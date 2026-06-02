@@ -59,6 +59,7 @@ type ClientConfig struct {
 	FragmentMax            int
 	BackgroundEnabled      bool
 	BackgroundInterval     time.Duration
+	ReliableUDP            bool
 }
 
 func DefaultClientConfig(serverAddr string) *ClientConfig {
@@ -68,7 +69,7 @@ func DefaultClientConfig(serverAddr string) *ClientConfig {
 	return &ClientConfig{
 		TransportConfig: &transport.Config{
 			ServerAddr: serverAddr,
-			Protocol:   "tcp",
+			Protocol:   "udp",
 		},
 		AuthKey:        authKey,
 		SwitchInterval: 5 * time.Minute,
@@ -95,6 +96,7 @@ func DefaultClientConfig(serverAddr string) *ClientConfig {
 		FragmentMax:            288,
 		BackgroundEnabled:      true,
 		BackgroundInterval:     30 * time.Second,
+		ReliableUDP:            true,
 	}
 }
 
@@ -119,13 +121,12 @@ func NewClient(config *ClientConfig) *Client {
 	config.TransportConfig.FragmentEnabled = config.FragmentEnabled
 	config.TransportConfig.FragmentMin = config.FragmentMin
 	config.TransportConfig.FragmentMax = config.FragmentMax
+	config.TransportConfig.ReliableUDP = config.ReliableUDP
+	config.TransportConfig.Protocol = "udp"
 
 	log.Printf("[DEBUG] AuthKey length: %d", len(config.AuthKey))
 	log.Printf("[DEBUG] Cipher: %s", config.Cipher)
-	log.Printf("[DEBUG] DNSServer: %s, DNSOverHTTPS: %v", config.DNSServer, config.DNSOverHTTPS)
-	log.Printf("[DEBUG] TLS SNI: %s, CertFetch: %v", config.TLSSNI, config.TLSCertFetch)
-	log.Printf("[DEBUG] Fragment: enabled=%v, min=%d, max=%d", config.FragmentEnabled, config.FragmentMin, config.FragmentMax)
-	log.Printf("[DEBUG] Background: enabled=%v, interval=%v", config.BackgroundEnabled, config.BackgroundInterval)
+	log.Printf("[DEBUG] ReliableUDP: %v", config.ReliableUDP)
 
 	if len(config.AuthKey) == 0 {
 		log.Printf("[ERROR] AuthKey is empty! Cannot start client.")
@@ -222,11 +223,6 @@ func (c *Client) performHandshake() error {
 	if conn == nil {
 		log.Printf("[Client] getConn returned nil")
 		return net.ErrClosed
-	}
-
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	log.Printf("[Client] Got connection, local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())

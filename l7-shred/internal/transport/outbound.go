@@ -7,6 +7,7 @@ import (
 
 	"github.com/l7-shred/core/internal/crypto"
 	"github.com/l7-shred/core/internal/shred"
+	"github.com/xtaci/kcp-go/v5"
 )
 
 type Outbound struct {
@@ -37,6 +38,9 @@ func NewOutbound(config *Config) (*Outbound, error) {
 }
 
 func (o *Outbound) Connect() error {
+	if o.config.ReliableUDP {
+		return o.connectReliableUDP()
+	}
 	if o.config.Protocol == "udp" {
 		return o.connectUDP()
 	}
@@ -55,14 +59,12 @@ func (o *Outbound) connectTCP() error {
 func (o *Outbound) connectUDP() error {
 	log.Printf("[UDP] Connecting to %s", o.config.ServerAddr)
 
-	// Создаём UDP соединение
 	conn, err := net.Dial("udp", o.config.ServerAddr)
 	if err != nil {
 		return err
 	}
 	o.packetConn = conn
 
-	// Сохраняем удалённый адрес
 	addr, err := net.ResolveUDPAddr("udp", o.config.ServerAddr)
 	if err != nil {
 		return err
@@ -70,6 +72,28 @@ func (o *Outbound) connectUDP() error {
 	o.remoteAddr = addr
 
 	log.Printf("[UDP] Connected to %s", o.config.ServerAddr)
+	return nil
+}
+
+func (o *Outbound) connectReliableUDP() error {
+	log.Printf("[ReliableUDP] Connecting to %s", o.config.ServerAddr)
+
+	kcpConn, err := kcp.DialWithOptions(o.config.ServerAddr, nil, 10, 3)
+	if err != nil {
+		return err
+	}
+
+	kcpConn.SetStreamMode(true)
+	kcpConn.SetWindowSize(1024, 1024)
+	kcpConn.SetNoDelay(1, 20, 2, 1)
+	kcpConn.SetMtu(1350)
+	kcpConn.SetReadBuffer(4194304)
+	kcpConn.SetWriteBuffer(4194304)
+
+	o.packetConn = kcpConn
+	o.remoteAddr = kcpConn.RemoteAddr()
+
+	log.Printf("[ReliableUDP] Connected to %s with KCP", o.config.ServerAddr)
 	return nil
 }
 

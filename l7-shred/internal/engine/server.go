@@ -102,7 +102,6 @@ func (s *Server) tunLoop() {
 		if len(data) == 0 {
 			continue
 		}
-		s.logger.Printf("TUN read %d bytes", len(data))
 
 		s.mu.RLock()
 		for _, sc := range s.connections {
@@ -112,8 +111,6 @@ func (s *Server) tunLoop() {
 			sc.writeMu.Unlock()
 			if err != nil {
 				s.logger.Printf("Failed to write to client %d: %v", sc.ID, err)
-			} else {
-				s.logger.Printf("Successfully sent to client %d (%d bytes)", sc.ID, len(wrapped))
 			}
 		}
 		s.mu.RUnlock()
@@ -215,20 +212,17 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 		}
 
 		if len(unwrapped) < 20 {
-			s.logger.Printf("Skip short packet: %d bytes from session %d", len(unwrapped), sc.ID)
 			continue
 		}
 
 		version := (unwrapped[0] >> 4) & 0x0F
 		if version != 4 && version != 6 {
-			s.logger.Printf("Skip invalid IP packet: version=%d from session %d", version, sc.ID)
 			continue
 		}
 
 		if version == 4 {
 			headerLen := int(unwrapped[0]&0x0F) * 4
 			if len(unwrapped) < headerLen {
-				s.logger.Printf("Skip malformed IPv4 packet: headerLen=%d, actual=%d", headerLen, len(unwrapped))
 				continue
 			}
 		}
@@ -236,8 +230,6 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 		if s.tunDev != nil {
 			if err := s.tunDev.Write(unwrapped); err != nil {
 				s.logger.Printf("TUN write error: %v", err)
-			} else {
-				s.logger.Printf("✅ TUN write OK: %d bytes", len(unwrapped))
 			}
 		}
 	}

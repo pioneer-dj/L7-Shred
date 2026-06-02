@@ -36,6 +36,9 @@ type Config struct {
 	DNSOverHTTPS     bool          `json:"dns_over_https"`
 	TLSSNI           string        `json:"tls_sni"`
 	TLSCertFetch     bool          `json:"tls_cert_fetch"`
+	ReliableUDP      bool          `json:"reliable_udp"`
+	CongestionCtrl   bool          `json:"congestion_control"`
+	MaxCwnd          int           `json:"max_cwnd"`
 
 	OnPacket func([]byte) `json:"-"`
 }
@@ -69,6 +72,9 @@ func DefaultConfig() *Config {
 		DNSOverHTTPS:     true,
 		TLSSNI:           "www.google.com",
 		TLSCertFetch:     true,
+		ReliableUDP:      true,
+		CongestionCtrl:   true,
+		MaxCwnd:          65535,
 	}
 }
 
@@ -116,6 +122,9 @@ func LoadConfig(path string) (*Config, error) {
 	if config.TLSSNI == "" {
 		config.TLSSNI = "www.google.com"
 	}
+	if config.MaxCwnd == 0 {
+		config.MaxCwnd = 65535
+	}
 
 	return &config, nil
 }
@@ -132,6 +141,9 @@ func (c *Config) Validate() error {
 	}
 	if c.FragmentMax < c.FragmentMin || c.FragmentMax > 1500 {
 		return ErrInvalidFragmentMax
+	}
+	if c.ReliableUDP && c.Protocol == "tcp" {
+		c.Protocol = "udp"
 	}
 	return nil
 }

@@ -5,8 +5,162 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
+	"log"
+	"sync"
 	"time"
 )
+
+type CongestionControl struct {
+	cwnd       uint32
+	ssthresh   uint32
+	rtt        time.Duration
+	rttVar     time.Duration
+	packetLoss bool
+	mu         sync.RWMutex
+}
+
+func NewCongestionControl() *CongestionControl {
+	return &CongestionControl{
+		cwnd:     10,
+		ssthresh: 65535,
+		rtt:      30 * time.Millisecond,
+	}
+}
+
+func (cc *CongestionControl) OnPacketSent(packetNum uint64, size int) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+}
+
+func (cc *CongestionControl) OnAckReceived(ackTime time.Duration) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	rtt := ackTime
+	cc.rtt = (cc.rtt*7 + rtt) / 8
+
+	if cc.cwnd < cc.ssthresh {
+		cc.cwnd += 1
+	} else {
+		cc.cwnd += 1 / cc.cwnd
+	}
+
+	if cc.cwnd > 1000 {
+		cc.cwnd = 1000
+	}
+}
+
+func (cc *CongestionControl) OnPacketLoss() {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	cc.ssthresh = cc.cwnd / 2
+	if cc.ssthresh < 2 {
+		cc.ssthresh = 2
+	}
+	cc.cwnd = 1
+	cc.packetLoss = true
+}
+
+func (cc *CongestionControl) GetWindow() uint32 {
+	cc.mu.RLock()
+	defer cc.mu.RUnlock()
+	return cc.cwnd
+}
+
+func (cc *CongestionControl) GetRTT() time.Duration {
+	cc.mu.RLock()
+	defer cc.mu.RUnlock()
+	return cc.rtt
+}
+
+type QUICTransport struct {
+	cc           *CongestionControl
+	packetNum    uint64
+	lastAck      uint64
+	sentPackets  map[uint64]time.Time
+	packetLosses int
+	mu           sync.RWMutex
+}
+
+func NewQUICTransport() *QUICTransport {
+	return &QUICTransport{
+		cc:          NewCongestionControl(),
+		packetNum:   0,
+		lastAck:     0,
+		sentPackets: make(map[uint64]time.Time),
+	}
+}
+
+func (q *QUICTransport) SendPacket(data []byte) []byte {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.packetNum++
+	packetNum := q.packetNum
+
+	q.sentPackets[packetNum] = time.Now()
+
+	header := make([]byte, 17)
+	header[0] = 0xC0 | 0x00
+	binary.BigEndian.PutUint32(header[1:5], 0x00000001)
+	binary.BigEndian.PutUint64(header[5:13], packetNum)
+
+	window := q.cc.GetWindow()
+	binary.BigEndian.PutUint32(header[13:17], window)
+
+	payload := make([]byte, len(data)+4)
+	binary.BigEndian.PutUint32(payload[0:4], uint32(len(data)))
+	copy(payload[4:], data)
+
+	return append(header, payload...)
+}
+
+func (q *QUICTransport) ProcessAck(ackNum uint64, ackDelay time.Duration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if ackNum <= q.lastAck {
+		return
+	}
+
+	for i := q.lastAck + 1; i <= ackNum; i++ {
+		if sendTime, ok := q.sentPackets[i]; ok {
+			rtt := time.Since(sendTime)
+			q.cc.OnAckReceived(rtt)
+			delete(q.sentPackets, i)
+		}
+	}
+
+	q.lastAck = ackNum
+}
+
+func (q *QUICTransport) DetectLoss() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	now := time.Now()
+	for packetNum, sendTime := range q.sentPackets {
+		if now.Sub(sendTime) > q.cc.GetRTT()*3 {
+			q.cc.OnPacketLoss()
+			delete(q.sentPackets, packetNum)
+			q.packetLosses++
+		}
+	}
+}
+
+func (q *QUICTransport) GetStats() map[string]interface{} {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	return map[string]interface{}{
+		"cwnd":          q.cc.GetWindow(),
+		"rtt_ms":        q.cc.GetRTT().Milliseconds(),
+		"packet_num":    q.packetNum,
+		"packet_losses": q.packetLosses,
+		"sent_pending":  len(q.sentPackets),
+	}
+}
 
 type QUICMask struct {
 	destConnID      []byte
@@ -24,6 +178,9 @@ type QUICMask struct {
 	connectionID    [20]byte
 	scid            []byte
 	dcid            []byte
+	transport       *QUICTransport
+	congestionCtrl  *CongestionControl
+	lastAckTime     time.Time
 }
 
 func NewQUICMask() *QUICMask {
@@ -73,16 +230,21 @@ func NewQUICMask() *QUICMask {
 		oneRTTSecret:    oneRTTSecret,
 		transportParams: transportParams,
 		connectionID:    connID,
+		transport:       NewQUICTransport(),
+		congestionCtrl:  NewCongestionControl(),
+		lastAckTime:     time.Now(),
 	}
 }
 
 func (q *QUICMask) Wrap(payload []byte) []byte {
+	q.transport.DetectLoss()
+
 	if !q.handshakeDone && q.handshakeStep < 8 {
 		return q.simulateHandshake()
 	}
 
 	q.handshakeDone = true
-	return q.simulateOneRTTPacket(payload)
+	return q.transport.SendPacket(payload)
 }
 
 func (q *QUICMask) simulateHandshake() []byte {
@@ -216,18 +378,6 @@ func (q *QUICMask) simulateZeroRTTPacket() []byte {
 }
 
 func (q *QUICMask) simulateOneRTTPacket(payload []byte) []byte {
-	headerLen := 1 + 4 + 16
-	buf := make([]byte, headerLen)
-
-	buf[0] = 0x40
-
-	packetNum := uint32(q.packetNum)
-	binary.BigEndian.PutUint32(buf[1:5], packetNum)
-
-	nonce := make([]byte, 12)
-	rand.Read(nonce)
-	copy(buf[5:17], nonce)
-
 	if payload == nil {
 		payload = make([]byte, 32+int(q.packetNum%100))
 		rand.Read(payload)
@@ -238,14 +388,7 @@ func (q *QUICMask) simulateOneRTTPacket(payload []byte) []byte {
 		encryptedPayload[i] = payload[i] ^ q.oneRTTSecret[i%32]
 	}
 
-	buf = append(buf, encryptedPayload...)
-
-	aead := q.packetNumCipher
-	tag := aead.Seal(nil, nonce, buf[:headerLen], nil)
-	buf = append(buf, tag...)
-
-	q.packetNum++
-	return buf
+	return q.transport.SendPacket(encryptedPayload)
 }
 
 func (q *QUICMask) simulateConnectionClose() []byte {
@@ -279,6 +422,28 @@ func (q *QUICMask) Unwrap(data []byte) ([]byte, error) {
 		}
 
 		packetType := data[0] & 0x3F
+
+		if packetType == 0x00 {
+			if len(data) < 17 {
+				return nil, ErrInvalidPacket
+			}
+			packetNum := binary.BigEndian.Uint64(data[5:13])
+			ackWindow := binary.BigEndian.Uint32(data[13:17])
+
+			q.transport.ProcessAck(packetNum, time.Since(q.lastAckTime))
+			q.lastAckTime = time.Now()
+
+			log.Printf("[QUIC] ACK received: packet=%d, window=%d, cwnd=%d",
+				packetNum, ackWindow, q.congestionCtrl.GetWindow())
+
+			if len(data) > 17 {
+				payloadLen := binary.BigEndian.Uint32(data[17:21])
+				if len(data) >= 21+int(payloadLen) {
+					return data[21 : 21+int(payloadLen)], nil
+				}
+			}
+			return nil, nil
+		}
 
 		switch packetType {
 		case 0x00:
@@ -439,4 +604,8 @@ func (q *QUICMask) IsHandshakeComplete() bool {
 
 func (q *QUICMask) GetConnectionID() []byte {
 	return q.connectionID[:]
+}
+
+func (q *QUICMask) GetCongestionStats() map[string]interface{} {
+	return q.transport.GetStats()
 }

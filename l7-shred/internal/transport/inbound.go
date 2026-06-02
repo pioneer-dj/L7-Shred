@@ -9,16 +9,18 @@ import (
 
 	"github.com/l7-shred/core/internal/crypto"
 	"github.com/l7-shred/core/internal/shred"
+	"github.com/xtaci/kcp-go/v5"
 )
 
 type Inbound struct {
-	config     *Config
-	listener   net.Listener
-	packetConn net.PacketConn
-	sessionMgr *shred.SessionManager
-	cipher     *crypto.AEADCipher
-	udpConns   map[string]*UDPConnWrapper
-	udpMu      sync.RWMutex
+	config      *Config
+	listener    net.Listener
+	packetConn  net.PacketConn
+	sessionMgr  *shred.SessionManager
+	cipher      *crypto.AEADCipher
+	udpConns    map[string]*UDPConnWrapper
+	udpMu       sync.RWMutex
+	kcpListener *kcp.Listener
 }
 
 type UDPConnWrapper struct {
@@ -45,10 +47,41 @@ func NewInbound(config *Config) (*Inbound, error) {
 }
 
 func (i *Inbound) Start() error {
+	if i.config.ReliableUDP {
+		return i.startReliableUDP()
+	}
 	if i.config.Mode == "udp" {
 		return i.startUDP()
 	}
 	return i.startTCP()
+}
+
+func (i *Inbound) startReliableUDP() error {
+	listener, err := kcp.ListenWithOptions(i.config.ListenAddr, nil, 10, 3)
+	if err != nil {
+		return err
+	}
+	i.kcpListener = listener
+	go i.kcpAcceptLoop()
+	return nil
+}
+
+func (i *Inbound) kcpAcceptLoop() {
+	for {
+		kcpConn, err := i.kcpListener.AcceptKCP()
+		if err != nil {
+			return
+		}
+
+		kcpConn.SetStreamMode(true)
+		kcpConn.SetWindowSize(1024, 1024)
+		kcpConn.SetNoDelay(1, 20, 2, 1)
+		kcpConn.SetMtu(1350)
+		kcpConn.SetReadBuffer(4194304)
+		kcpConn.SetWriteBuffer(4194304)
+
+		go i.handleConnection(kcpConn)
+	}
 }
 
 func (i *Inbound) startTCP() error {
@@ -145,7 +178,6 @@ func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
 		i.udpMu.Unlock()
 	}
 
-	// Не шифруем handshake пакеты (они уже зашифрованы масками)
 	select {
 	case wrapper.readChan <- data:
 	default:
@@ -154,14 +186,15 @@ func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
 }
 
 func (i *Inbound) Accept() (net.Conn, error) {
+	if i.kcpListener != nil {
+		return i.kcpListener.AcceptKCP()
+	}
 	if i.listener != nil {
 		return i.listener.Accept()
 	}
-
 	if i.packetConn != nil {
 		return i.acceptUDP()
 	}
-
 	return nil, net.ErrClosed
 }
 
@@ -190,6 +223,9 @@ func (i *Inbound) acceptUDP() (net.Conn, error) {
 }
 
 func (i *Inbound) Stop() error {
+	if i.kcpListener != nil {
+		i.kcpListener.Close()
+	}
 	if i.listener != nil {
 		i.listener.Close()
 	}
