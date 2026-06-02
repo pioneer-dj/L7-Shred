@@ -276,18 +276,16 @@ func (hm *HandshakeManager) PerformClientHandshakeAsync(conn net.Conn, interval 
 	packet := append(synData, signature...)
 	log.Printf("[Handshake] Total packet length: %d", len(packet))
 
-	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		log.Printf("[Handshake] SetWriteDeadline error: %v", err)
-		return err
+	// Отправляем SYN с повторами для UDP
+	log.Printf("[Handshake] Sending SYN to server (with retries)...")
+	for i := 0; i < 3; i++ {
+		if _, err := conn.Write(packet); err != nil {
+			log.Printf("[Handshake] Write error (attempt %d): %v", i+1, err)
+		} else {
+			log.Printf("[Handshake] Wrote %d bytes (attempt %d)", len(packet), i+1)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-
-	log.Printf("[Handshake] Sending SYN to server...")
-	n, err := conn.Write(packet)
-	if err != nil {
-		log.Printf("[Handshake] Write error: %v", err)
-		return err
-	}
-	log.Printf("[Handshake] Wrote %d bytes", n)
 
 	log.Printf("[Handshake] Waiting for ACK via channel (timeout: %v)", timeout)
 
@@ -327,8 +325,6 @@ func (hm *HandshakeManager) PerformClientHandshakeAsync(conn net.Conn, interval 
 		}
 
 		hm.state.MarkSeen(ack.Sequence)
-		conn.SetWriteDeadline(time.Time{})
-		conn.SetReadDeadline(time.Time{})
 		log.Printf("[Handshake] ========== CLIENT HANDSHAKE SUCCESS ==========")
 		return nil
 
@@ -360,71 +356,52 @@ func (hm *HandshakeManager) PerformClientHandshake(conn net.Conn, interval time.
 	packet := append(synData, signature...)
 	log.Printf("[Handshake] Total packet length: %d", len(packet))
 
-	if err := conn.SetWriteDeadline(time.Now().Add(hm.timeout)); err != nil {
-		log.Printf("[Handshake] SetWriteDeadline error: %v", err)
-		return err
+	for i := 0; i < 3; i++ {
+		if _, err := conn.Write(packet); err != nil {
+			log.Printf("[Handshake] Write error (attempt %d): %v", i+1, err)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-
-	log.Printf("[Handshake] Sending SYN to server...")
-	n, err := conn.Write(packet)
-	if err != nil {
-		log.Printf("[Handshake] Write error: %v", err)
-		return err
-	}
-	log.Printf("[Handshake] Wrote %d bytes", n)
 
 	if err := conn.SetReadDeadline(time.Now().Add(hm.timeout)); err != nil {
 		log.Printf("[Handshake] SetReadDeadline error: %v", err)
 		return err
 	}
 
-	log.Printf("[Handshake] Waiting for ACK from server...")
 	ackBuf := make([]byte, 4096)
-	n, err = conn.Read(ackBuf)
+	n, err := conn.Read(ackBuf)
 	if err != nil {
 		log.Printf("[Handshake] Read error: %v", err)
-		log.Printf("[Handshake] Connection state after error: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 		return err
 	}
 
 	log.Printf("[Handshake] Received %d bytes", n)
-	log.Printf("[Handshake] First 20 bytes: %x", ackBuf[:min(n, 20)])
 
 	if n < 32 {
-		log.Printf("[Handshake] Response too short: %d bytes", n)
 		return ErrAuthFailed
 	}
 
 	ackData := ackBuf[:n-32]
 	ackSignature := ackBuf[n-32 : n]
-	log.Printf("[Handshake] ACK data length: %d, signature length: %d", len(ackData), len(ackSignature))
 
 	if !hm.verify(ackData, ackSignature) {
-		log.Printf("[Handshake] ACK signature verification failed")
 		return ErrAuthFailed
 	}
-	log.Printf("[Handshake] ACK signature verified")
 
 	ack, err := DecodeHandshake(ackData)
 	if err != nil {
-		log.Printf("[Handshake] Decode error: %v", err)
 		return err
 	}
-	log.Printf("[Handshake] ACK decoded: Type=%d, Sequence=%d", ack.Type, ack.Sequence)
 
 	if ack.Type != HandshakeAck {
-		log.Printf("[Handshake] Wrong response type: %d, expected %d", ack.Type, HandshakeAck)
 		return ErrAuthFailed
 	}
 
 	if hm.state.IsReplay(ack.Sequence, 30*time.Second) {
-		log.Printf("[Handshake] Replay detected for sequence %d", ack.Sequence)
 		return ErrHandshakeReplay
 	}
 
 	hm.state.MarkSeen(ack.Sequence)
-	conn.SetWriteDeadline(time.Time{})
-	conn.SetReadDeadline(time.Time{})
 	log.Printf("[Handshake] ========== CLIENT HANDSHAKE SUCCESS ==========")
 
 	return nil
@@ -504,19 +481,15 @@ func (hm *HandshakeManager) PerformServerHandshake(conn net.Conn) (*SessionConfi
 		return nil, err
 	}
 
-	n, err = conn.Write(append(ackData, ackSignature...))
-	if err != nil {
-		log.Printf("[Handshake] Write error: %v", err)
-		return nil, err
+	// Отправляем ACK с повторами
+	for i := 0; i < 3; i++ {
+		if _, err := conn.Write(append(ackData, ackSignature...)); err != nil {
+			log.Printf("[Handshake] Write error (attempt %d): %v", i+1, err)
+		} else {
+			log.Printf("[Handshake] Wrote %d bytes ACK (attempt %d)", len(ackData)+len(ackSignature), i+1)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	log.Printf("[Handshake] Wrote %d bytes ACK", n)
-
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-	}
-
-	conn.SetWriteDeadline(time.Time{})
-	conn.SetReadDeadline(time.Time{})
 
 	log.Printf("[Handshake] ========== SERVER HANDSHAKE SUCCESS ==========")
 	return config, nil

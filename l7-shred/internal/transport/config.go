@@ -29,6 +29,13 @@ type Config struct {
 	ChaffTargets     []string      `json:"chaffing_targets"`
 	SessionTimeout   int           `json:"session_timeout"`
 	MaxSessions      int           `json:"max_sessions"`
+	FragmentEnabled  bool          `json:"fragment_enabled"`
+	FragmentMin      int           `json:"fragment_min"`
+	FragmentMax      int           `json:"fragment_max"`
+	DNSServer        string        `json:"dns_server"`
+	DNSOverHTTPS     bool          `json:"dns_over_https"`
+	TLSSNI           string        `json:"tls_sni"`
+	TLSCertFetch     bool          `json:"tls_cert_fetch"`
 
 	OnPacket func([]byte) `json:"-"`
 }
@@ -37,24 +44,31 @@ func DefaultConfig() *Config {
 	return &Config{
 		ServerAddr:       "",
 		ListenAddr:       ":8443",
-		Mode:             "udp",
-		Protocol:         "udp",
+		Mode:             "tcp",
+		Protocol:         "tcp",
 		Cipher:           "aes-256-gcm",
 		PostQuantum:      false,
-		MTU:              1400,
+		MTU:              1350,
 		MultiThreading:   true,
 		PaddingEnabled:   true,
-		PaddingMin:       32,
-		PaddingMax:       288,
+		PaddingMin:       16,
+		PaddingMax:       64,
 		PaddingRotate:    5,
 		JitterEnabled:    true,
-		JitterMeanMs:     2,
-		JitterStdDevMs:   1,
+		JitterMeanMs:     5,
+		JitterStdDevMs:   3,
 		JitterLossRate:   0.001,
 		ChaffingEnabled:  false,
 		ChaffingInterval: 1 * time.Second,
 		SessionTimeout:   300,
 		MaxSessions:      1000,
+		FragmentEnabled:  true,
+		FragmentMin:      32,
+		FragmentMax:      288,
+		DNSServer:        "8.8.8.8",
+		DNSOverHTTPS:     true,
+		TLSSNI:           "www.google.com",
+		TLSCertFetch:     true,
 	}
 }
 
@@ -70,7 +84,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	if config.MTU == 0 {
-		config.MTU = 1400
+		config.MTU = 1350
 	}
 	if config.Cipher == "" {
 		config.Cipher = "aes-256-gcm"
@@ -80,6 +94,27 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if config.MaxSessions == 0 {
 		config.MaxSessions = 1000
+	}
+	if config.FragmentMin == 0 {
+		config.FragmentMin = 32
+	}
+	if config.FragmentMax == 0 {
+		config.FragmentMax = 288
+	}
+	if config.PaddingMin == 0 {
+		config.PaddingMin = 16
+	}
+	if config.PaddingMax == 0 {
+		config.PaddingMax = 64
+	}
+	if config.JitterMeanMs == 0 {
+		config.JitterMeanMs = 5
+	}
+	if config.DNSServer == "" {
+		config.DNSServer = "8.8.8.8"
+	}
+	if config.TLSSNI == "" {
+		config.TLSSNI = "www.google.com"
 	}
 
 	return &config, nil
@@ -92,10 +127,15 @@ func (c *Config) Validate() error {
 	if c.MTU < 576 || c.MTU > 9000 {
 		return ErrInvalidMTU
 	}
+	if c.FragmentMin < 32 || c.FragmentMin > 1500 {
+		return ErrInvalidFragmentMin
+	}
+	if c.FragmentMax < c.FragmentMin || c.FragmentMax > 1500 {
+		return ErrInvalidFragmentMax
+	}
 	return nil
 }
 
 func (c *Config) GetSecretKey() []byte {
 	return []byte(c.SecretKey)
 }
-

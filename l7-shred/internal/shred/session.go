@@ -78,10 +78,16 @@ func (sm *SessionManager) CreateSession() *Session {
 	config := &SessionConfig{
 		SwitchInterval: 5 * time.Minute,
 		Modes: []ProtocolMode{
-			ModeMinecraft,
+			ModeVK,
+			ModeRuTube,
+			ModeYandex,
+			ModeOzon,
+			ModeWildberries,
+			ModeSberID,
+			ModeGosuslugi,
 			ModeWebRTC,
 			ModeQUIC,
-			ModeRuTube,
+			ModeTLS,
 		},
 		EnableReplayProtection: true,
 		ReplayWindowSize:       64,

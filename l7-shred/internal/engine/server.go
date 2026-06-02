@@ -141,6 +141,11 @@ func (s *Server) acceptLoop() {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	s.logger.Printf("New connection from %s", conn.RemoteAddr())
 
 	config, err := s.handshakeMgr.PerformServerHandshake(conn)
@@ -180,6 +185,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 func (s *Server) handleDataExchange(sc *ServerConnection) {
 	scratch := make([]byte, 65536)
 
+	sc.Conn.SetReadDeadline(time.Time{})
+	sc.Conn.SetWriteDeadline(time.Time{})
+
 	for {
 		select {
 		case <-s.stopChan:
@@ -187,13 +195,8 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 		default:
 		}
 
-		sc.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
 		data, err := readFrame(sc.Conn, scratch)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
 			s.logger.Printf("Read error from session %d: %v", sc.ID, err)
 			return
 		}
@@ -216,13 +219,19 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 			continue
 		}
 
-		version := unwrapped[0] >> 4
-		proto := unwrapped[9]
-		srcIP := net.IP(unwrapped[12:16])
-		dstIP := net.IP(unwrapped[16:20])
+		version := (unwrapped[0] >> 4) & 0x0F
+		if version != 4 && version != 6 {
+			s.logger.Printf("Skip invalid IP packet: version=%d from session %d", version, sc.ID)
+			continue
+		}
 
-		s.logger.Printf("📦 Packet: version=%d, len=%d, proto=%d, src=%s, dst=%s",
-			version, len(unwrapped), proto, srcIP.String(), dstIP.String())
+		if version == 4 {
+			headerLen := int(unwrapped[0]&0x0F) * 4
+			if len(unwrapped) < headerLen {
+				s.logger.Printf("Skip malformed IPv4 packet: headerLen=%d, actual=%d", headerLen, len(unwrapped))
+				continue
+			}
+		}
 
 		if s.tunDev != nil {
 			if err := s.tunDev.Write(unwrapped); err != nil {
@@ -230,8 +239,6 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 			} else {
 				s.logger.Printf("✅ TUN write OK: %d bytes", len(unwrapped))
 			}
-		} else {
-			s.logger.Printf("TUN device is nil, cannot write")
 		}
 	}
 }

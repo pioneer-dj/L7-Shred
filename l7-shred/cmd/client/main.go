@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/windows"
+
 	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
@@ -21,7 +23,15 @@ var (
 )
 
 func main() {
-	configPath := flag.String("config", "configs/client.desktop.json", "config file path")
+	if !isAdmin() {
+		log.Println("Requesting administrator privileges...")
+		if err := runAsAdmin(); err != nil {
+			log.Fatalf("Failed to elevate: %v", err)
+		}
+		return
+	}
+
+	configPath := flag.String("config", "config_tcp.json", "config file path")
 	tunAddr := flag.String("tun", "10.0.0.2", "TUN interface IP address")
 	version := flag.Bool("version", false, "show version")
 	flag.Parse()
@@ -50,13 +60,28 @@ func main() {
 		AuthKey:        []byte(cfg.SecretKey),
 		SwitchInterval: 5 * time.Minute,
 		Modes: []shred.ProtocolMode{
-			shred.ModeMinecraft,
+			shred.ModeVK,
+			shred.ModeRuTube,
+			shred.ModeYandex,
+			shred.ModeOzon,
+			shred.ModeWildberries,
+			shred.ModeSberID,
+			shred.ModeGosuslugi,
 			shred.ModeWebRTC,
 			shred.ModeQUIC,
-			shred.ModeRuTube,
+			shred.ModeTLS,
 		},
 		HandshakeTimeout:       10 * time.Second,
 		EnableReplayProtection: true,
+		DNSServer:              cfg.DNSServer,
+		DNSOverHTTPS:           cfg.DNSOverHTTPS,
+		TLSSNI:                 cfg.TLSSNI,
+		TLSCertFetch:           cfg.TLSCertFetch,
+		FragmentEnabled:        cfg.FragmentEnabled,
+		FragmentMin:            cfg.FragmentMin,
+		FragmentMax:            cfg.FragmentMax,
+		BackgroundEnabled:      true,
+		BackgroundInterval:     30 * time.Second,
 	}
 
 	client := engine.NewClient(clientConfig)
@@ -81,6 +106,12 @@ func main() {
 	}
 	log.Printf("TUN device created, IP: %s", *tunAddr)
 
+	tunName := tunDev.Name()
+
+	// Устанавливаем TUN метрику 1 (приоритетный)
+	exec.Command("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1").Run()
+	log.Printf("Set TUN interface metric to 1")
+
 	go func() {
 		for {
 			data, err := tunDev.Read()
@@ -100,14 +131,11 @@ func main() {
 		}
 	})
 
-	cmd := exec.Command("route", "add", "0.0.0.0", "mask", "0.0.0.0", "10.0.0.1", "metric", "1")
-	if err := cmd.Run(); err != nil {
-		log.Printf("Warning: Failed to add route automatically: %v", err)
-		log.Println("Please run manually as administrator: route add 0.0.0.0 mask 0.0.0.0 10.0.0.1 metric 1")
-	} else {
+	go func() {
+		time.Sleep(2 * time.Second)
+		exec.Command("route", "add", "0.0.0.0", "mask", "0.0.0.0", "10.0.0.1", "metric", "1").Run()
 		log.Println("Default route added successfully")
-		client.SetTunAdded(true)
-	}
+	}()
 
 	log.Println("=========================================")
 	log.Println("VPN is running!")
@@ -127,21 +155,14 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	sig := <-sigChan
-	log.Printf("Received signal: %v, shutting down...", sig)
+	<-sigChan
+	log.Println("Shutting down...")
 
-	stopChan := make(chan bool)
-	go func() {
-		client.Stop()
-		stopChan <- true
-	}()
+	exec.Command("route", "delete", "0.0.0.0").Run()
+	exec.Command("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=auto").Run()
 
-	select {
-	case <-stopChan:
-		log.Println("Client stopped gracefully")
-	case <-time.After(10 * time.Second):
-		log.Println("Shutdown timeout, forcing exit")
-	}
+	client.Stop()
+	log.Println("Client stopped")
 }
 
 func validateConfig(cfg *transport.Config) error {
@@ -155,4 +176,19 @@ func validateConfig(cfg *transport.Config) error {
 		return flag.ErrHelp
 	}
 	return nil
+}
+
+func isAdmin() bool {
+	_, err := os.Open(`\\.\PHYSICALDRIVE0`)
+	return err == nil
+}
+
+func runAsAdmin() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	verb, _ := windows.UTF16PtrFromString("runas")
+	file, _ := windows.UTF16PtrFromString(exe)
+	return windows.ShellExecute(0, verb, file, nil, nil, 1)
 }

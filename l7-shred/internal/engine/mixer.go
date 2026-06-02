@@ -21,6 +21,7 @@ const (
 	ModeSTUN
 	ModeZoom
 	ModeMinecraft
+	ModeTLS
 )
 
 func (m ProtocolMode) String() string {
@@ -82,8 +83,8 @@ func (f *MaskFactory) CreateMask(mode ProtocolMode) masks.Masker {
 		return masks.NewSTUNMask()
 	case ModeZoom:
 		return masks.NewZoomMask()
-	case ModeMinecraft:
-		return masks.NewMinecraftMask()
+	case ModeTLS:
+		return masks.NewTLSMask()
 	default:
 		return masks.NewVKMask()
 	}

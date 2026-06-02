@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"log"
 	"net"
 	"sync"
 
@@ -12,6 +13,7 @@ type Outbound struct {
 	config     *Config
 	conn       net.Conn
 	packetConn net.Conn
+	remoteAddr net.Addr
 	session    *shred.Session
 	cipher     *crypto.AEADCipher
 	mu         sync.RWMutex
@@ -35,7 +37,7 @@ func NewOutbound(config *Config) (*Outbound, error) {
 }
 
 func (o *Outbound) Connect() error {
-	if o.config.Mode == "udp" {
+	if o.config.Protocol == "udp" {
 		return o.connectUDP()
 	}
 	return o.connectTCP()
@@ -51,11 +53,23 @@ func (o *Outbound) connectTCP() error {
 }
 
 func (o *Outbound) connectUDP() error {
+	log.Printf("[UDP] Connecting to %s", o.config.ServerAddr)
+
+	// Создаём UDP соединение
 	conn, err := net.Dial("udp", o.config.ServerAddr)
 	if err != nil {
 		return err
 	}
 	o.packetConn = conn
+
+	// Сохраняем удалённый адрес
+	addr, err := net.ResolveUDPAddr("udp", o.config.ServerAddr)
+	if err != nil {
+		return err
+	}
+	o.remoteAddr = addr
+
+	log.Printf("[UDP] Connected to %s", o.config.ServerAddr)
 	return nil
 }
 
@@ -88,3 +102,6 @@ func (o *Outbound) Conn() net.Conn {
 	return o.packetConn
 }
 
+func (o *Outbound) RemoteAddr() net.Addr {
+	return o.remoteAddr
+}

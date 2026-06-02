@@ -2,6 +2,7 @@ package transport
 
 import (
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -29,18 +30,18 @@ type UDPConnWrapper struct {
 }
 
 func NewInbound(config *Config) (*Inbound, error) {
-    secretKeyBytes := []byte(config.SecretKey)
-    cipher, err := crypto.NewAEADCipher(secretKeyBytes)
-    if err != nil {
-        return nil, err
-    }
+	secretKeyBytes := []byte(config.SecretKey)
+	cipher, err := crypto.NewAEADCipher(secretKeyBytes)
+	if err != nil {
+		return nil, err
+	}
 
-    return &Inbound{
-        config:     config,
-        sessionMgr: shred.NewSessionManager(),
-        cipher:     cipher,
-        udpConns:   make(map[string]*UDPConnWrapper),
-    }, nil
+	return &Inbound{
+		config:     config,
+		sessionMgr: shred.NewSessionManager(),
+		cipher:     cipher,
+		udpConns:   make(map[string]*UDPConnWrapper),
+	}, nil
 }
 
 func (i *Inbound) Start() error {
@@ -133,6 +134,7 @@ func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
 	i.udpMu.RUnlock()
 
 	if !exists {
+		log.Printf("[UDP] New connection from %s", addrStr)
 		wrapper = &UDPConnWrapper{
 			conn:       i.packetConn,
 			remoteAddr: addr,
@@ -143,14 +145,11 @@ func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
 		i.udpMu.Unlock()
 	}
 
-	decrypted, err := i.cipher.Decrypt(data)
-	if err != nil {
-		return
-	}
-
+	// Не шифруем handshake пакеты (они уже зашифрованы масками)
 	select {
-	case wrapper.readChan <- decrypted:
+	case wrapper.readChan <- data:
 	default:
+		log.Printf("[UDP] Dropping packet from %s (channel full)", addrStr)
 	}
 }
 
@@ -173,6 +172,7 @@ func (i *Inbound) acceptUDP() (net.Conn, error) {
 			select {
 			case data := <-wrapper.readChan:
 				i.udpMu.RUnlock()
+				log.Printf("[UDP] Accepting connection from %s", addrStr)
 				return &UDPConn{
 					wrapper:    wrapper,
 					remoteAddr: wrapper.remoteAddr,
@@ -284,4 +284,3 @@ func (u *UDPConn) SetReadDeadline(t time.Time) error {
 func (u *UDPConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
-

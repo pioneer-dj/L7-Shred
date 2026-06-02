@@ -32,10 +32,14 @@ type Client struct {
 	bytesRecv    uint64
 	onPacket     func([]byte)
 
-	handshakeChan chan []byte
-	handshakeErr  chan error
-	handshakeDone bool
-	tunAdded      bool
+	handshakeChan   chan []byte
+	handshakeErr    chan error
+	handshakeDone   bool
+	tunAdded        bool
+	currentDomain   string
+	background      *BackgroundTraffic
+	originalGateway string
+	originalIfIdx   string
 }
 
 type ClientConfig struct {
@@ -46,6 +50,15 @@ type ClientConfig struct {
 	Modes                  []shred.ProtocolMode
 	HandshakeTimeout       time.Duration
 	EnableReplayProtection bool
+	DNSServer              string
+	DNSOverHTTPS           bool
+	TLSSNI                 string
+	TLSCertFetch           bool
+	FragmentEnabled        bool
+	FragmentMin            int
+	FragmentMax            int
+	BackgroundEnabled      bool
+	BackgroundInterval     time.Duration
 }
 
 func DefaultClientConfig(serverAddr string) *ClientConfig {
@@ -60,13 +73,28 @@ func DefaultClientConfig(serverAddr string) *ClientConfig {
 		AuthKey:        authKey,
 		SwitchInterval: 5 * time.Minute,
 		Modes: []shred.ProtocolMode{
-			shred.ModeMinecraft,
+			shred.ModeVK,
+			shred.ModeRuTube,
+			shred.ModeYandex,
+			shred.ModeOzon,
+			shred.ModeWildberries,
+			shred.ModeSberID,
+			shred.ModeGosuslugi,
 			shred.ModeWebRTC,
 			shred.ModeQUIC,
-			shred.ModeRuTube,
+			shred.ModeTLS,
 		},
 		HandshakeTimeout:       10 * time.Second,
 		EnableReplayProtection: true,
+		DNSServer:              "8.8.8.8",
+		DNSOverHTTPS:           true,
+		TLSSNI:                 "www.google.com",
+		TLSCertFetch:           true,
+		FragmentEnabled:        true,
+		FragmentMin:            32,
+		FragmentMax:            288,
+		BackgroundEnabled:      true,
+		BackgroundInterval:     30 * time.Second,
 	}
 }
 
@@ -84,9 +112,20 @@ func NewClient(config *ClientConfig) *Client {
 	}
 	config.TransportConfig.Cipher = config.Cipher
 	config.TransportConfig.SecretKey = string(config.AuthKey)
+	config.TransportConfig.DNSServer = config.DNSServer
+	config.TransportConfig.DNSOverHTTPS = config.DNSOverHTTPS
+	config.TransportConfig.TLSSNI = config.TLSSNI
+	config.TransportConfig.TLSCertFetch = config.TLSCertFetch
+	config.TransportConfig.FragmentEnabled = config.FragmentEnabled
+	config.TransportConfig.FragmentMin = config.FragmentMin
+	config.TransportConfig.FragmentMax = config.FragmentMax
 
 	log.Printf("[DEBUG] AuthKey length: %d", len(config.AuthKey))
 	log.Printf("[DEBUG] Cipher: %s", config.Cipher)
+	log.Printf("[DEBUG] DNSServer: %s, DNSOverHTTPS: %v", config.DNSServer, config.DNSOverHTTPS)
+	log.Printf("[DEBUG] TLS SNI: %s, CertFetch: %v", config.TLSSNI, config.TLSCertFetch)
+	log.Printf("[DEBUG] Fragment: enabled=%v, min=%d, max=%d", config.FragmentEnabled, config.FragmentMin, config.FragmentMax)
+	log.Printf("[DEBUG] Background: enabled=%v, interval=%v", config.BackgroundEnabled, config.BackgroundInterval)
 
 	if len(config.AuthKey) == 0 {
 		log.Printf("[ERROR] AuthKey is empty! Cannot start client.")
@@ -106,7 +145,7 @@ func NewClient(config *ClientConfig) *Client {
 
 	handshakeMgr := shred.NewHandshakeManager(config.AuthKey, config.HandshakeTimeout)
 
-	return &Client{
+	client := &Client{
 		config:        config.TransportConfig,
 		session:       session,
 		sessionMgr:    sessionMgr,
@@ -118,7 +157,20 @@ func NewClient(config *ClientConfig) *Client {
 		handshakeErr:  make(chan error, 1),
 		handshakeDone: false,
 		tunAdded:      false,
+		currentDomain: "",
 	}
+
+	if config.BackgroundEnabled {
+		bgConfig := &BackgroundConfig{
+			Enabled:   config.BackgroundEnabled,
+			Interval:  config.BackgroundInterval,
+			JitterMs:  5000,
+			Randomize: true,
+		}
+		client.background = NewBackgroundTraffic(client.Send, bgConfig)
+	}
+
+	return client
 }
 
 func (c *Client) Start() error {
@@ -171,6 +223,12 @@ func (c *Client) performHandshake() error {
 		log.Printf("[Client] getConn returned nil")
 		return net.ErrClosed
 	}
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	log.Printf("[Client] Got connection, local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 
 	timeout := 10 * time.Second
@@ -279,6 +337,22 @@ func (c *Client) processIncomingPacket(data []byte) {
 		return
 	}
 
+	if len(unwrapped) > 43 && unwrapped[0] == 0x16 {
+		sni := extractSNI(unwrapped)
+		if sni != "" && sni != c.currentDomain {
+			c.currentDomain = sni
+			c.mixer.SwitchToDomain(sni)
+			log.Printf("[Client] Detected SNI: %s, switched mask", sni)
+		}
+	}
+
+	if len(unwrapped) >= 20 {
+		version := (unwrapped[0] >> 4) & 0x0F
+		if version != 4 && version != 6 {
+			return
+		}
+	}
+
 	c.mu.RLock()
 	callback := c.onPacket
 	c.mu.RUnlock()
@@ -288,9 +362,67 @@ func (c *Client) processIncomingPacket(data []byte) {
 	}
 }
 
+func extractSNI(data []byte) string {
+	if len(data) < 43 {
+		return ""
+	}
+
+	sessionIDLen := int(data[43])
+	offset := 44 + sessionIDLen
+
+	if offset+2 > len(data) {
+		return ""
+	}
+
+	cipherSuitesLen := int(data[offset])<<8 | int(data[offset+1])
+	offset += 2 + cipherSuitesLen
+
+	if offset+1 > len(data) {
+		return ""
+	}
+
+	compressionMethodsLen := int(data[offset])
+	offset += 1 + compressionMethodsLen
+
+	if offset+2 > len(data) {
+		return ""
+	}
+
+	extensionsLen := int(data[offset])<<8 | int(data[offset+1])
+	offset += 2
+	endExt := offset + extensionsLen
+
+	for offset+4 <= endExt {
+		extType := int(data[offset])<<8 | int(data[offset+1])
+		extLen := int(data[offset+2])<<8 | int(data[offset+3])
+		offset += 4
+
+		if extType == 0x0000 {
+			if offset+2 > len(data) {
+				return ""
+			}
+			sniLen := int(data[offset])<<8 | int(data[offset+1])
+			offset += 2
+			if offset+sniLen <= len(data) {
+				return string(data[offset : offset+sniLen])
+			}
+		}
+		offset += extLen
+	}
+
+	return ""
+}
+
 func (c *Client) Send(payload []byte) error {
 	if !c.IsConnected() {
 		return net.ErrClosed
+	}
+
+	if len(payload) >= 20 {
+		version := (payload[0] >> 4) & 0x0F
+		if version != 4 && version != 6 {
+			return nil
+		}
 	}
 
 	c.mu.Lock()
@@ -340,13 +472,17 @@ func (c *Client) Stop() error {
 		return nil
 	}
 
+	log.Printf("[Client] Stopping client...")
+
+	if c.background != nil {
+		c.background.Stop()
+	}
+
 	if c.tunAdded {
 		cmd := exec.Command("route", "delete", "0.0.0.0")
 		cmd.Run()
 		log.Printf("[Client] Removed default route")
 	}
-
-	log.Printf("[Client] Stopping client...")
 
 	close(c.stopChan)
 	c.wg.Wait()

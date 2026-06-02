@@ -1,6 +1,7 @@
 package shred
 
 import (
+	"log"
 	"time"
 
 	"github.com/l7-shred/core/internal/masks"
@@ -19,7 +20,11 @@ const (
 	ModeVK
 	ModeSTUN
 	ModeZoom
-	ModeMinecraft
+	ModeOzon
+	ModeWildberries
+	ModeSberID
+	ModeGosuslugi
+	ModeTLS
 )
 
 func (m ProtocolMode) String() string {
@@ -44,8 +49,16 @@ func (m ProtocolMode) String() string {
 		return "stun"
 	case ModeZoom:
 		return "zoom"
-	case ModeMinecraft:
-		return "minecraft"
+	case ModeOzon:
+		return "ozon"
+	case ModeWildberries:
+		return "wildberries"
+	case ModeSberID:
+		return "sberid"
+	case ModeGosuslugi:
+		return "gosuslugi"
+	case ModeTLS:
+		return "tls"
 	default:
 		return "unknown"
 	}
@@ -79,8 +92,16 @@ func (f *MaskFactory) CreateMask(mode ProtocolMode) masks.Masker {
 		return masks.NewSTUNMask()
 	case ModeZoom:
 		return masks.NewZoomMask()
-	case ModeMinecraft:
-		return masks.NewMinecraftMask()
+	case ModeOzon:
+		return masks.NewOzonMask()
+	case ModeWildberries:
+		return masks.NewWildberriesMask()
+	case ModeSberID:
+		return masks.NewSberIDMask()
+	case ModeGosuslugi:
+		return masks.NewGosuslugiMask()
+	case ModeTLS:
+		return masks.NewTLSMask()
 	default:
 		return masks.NewVKMask()
 	}
@@ -98,26 +119,66 @@ type MaskMixer struct {
 	packetsWrapped   int64
 	packetsUnwrapped int64
 	errorsCount      int64
+	selector         *masks.MaskSelector
+	timeBasedEnabled bool
+	isDayModeActive  bool
+	dayModes         []ProtocolMode
+	nightModes       []ProtocolMode
+}
+
+func getHourOfDay() int {
+	return time.Now().Hour()
+}
+
+func isDayTime() bool {
+	hour := getHourOfDay()
+	return hour >= 8 && hour < 23
 }
 
 func NewMaskMixer(switchInterval time.Duration) *MaskMixer {
-	modes := []ProtocolMode{
-		ModeMinecraft,
+	dayModes := []ProtocolMode{
+		ModeVK,
+		ModeYandex,
+		ModeOzon,
+		ModeWildberries,
+		ModeSberID,
+		ModeGosuslugi,
 		ModeWebRTC,
 		ModeQUIC,
+		ModeTLS,
+	}
+
+	nightModes := []ProtocolMode{
 		ModeRuTube,
-		ModeYandex,
+		ModeTLS,
+		ModeQUIC,
+		ModeWebRTC,
 		ModeVK,
 	}
 
+	var modes []ProtocolMode
+	var isDayModeActive bool
+	if isDayTime() {
+		modes = dayModes
+		isDayModeActive = true
+	} else {
+		modes = nightModes
+		isDayModeActive = false
+	}
+
 	mixer := &MaskMixer{
-		modes:          modes,
-		switchInterval: switchInterval,
-		lastSwitch:     time.Now(),
-		currentMode:    modes[0],
-		factory:        NewMaskFactory(),
-		mu:             make(chan struct{}, 1),
-		stats:          make(map[ProtocolMode]int64),
+		modes:            modes,
+		switchInterval:   switchInterval,
+		lastSwitch:       time.Now(),
+		currentMode:      modes[0],
+		factory:          NewMaskFactory(),
+		mu:               make(chan struct{}, 1),
+		stats:            make(map[ProtocolMode]int64),
+		selector:         masks.NewMaskSelector(),
+		timeBasedEnabled: true,
+		isDayModeActive:  isDayModeActive,
+		dayModes:         dayModes,
+		nightModes:       nightModes,
 	}
 
 	mixer.mu <- struct{}{}
@@ -133,6 +194,30 @@ func (m *MaskMixer) lock() {
 
 func (m *MaskMixer) unlock() {
 	<-m.mu
+}
+
+func (m *MaskMixer) checkTimeBasedRotation() {
+	if !m.timeBasedEnabled {
+		return
+	}
+
+	currentIsDay := isDayTime()
+
+	if currentIsDay && !m.isDayModeActive {
+		m.modes = m.dayModes
+		m.isDayModeActive = true
+		m.currentMode = m.modes[0]
+		m.currentMask = m.factory.CreateMask(m.currentMode)
+		m.lastSwitch = time.Now()
+		log.Printf("[MaskMixer] Time-based rotation: switched to DAY mode (hour: %d)", getHourOfDay())
+	} else if !currentIsDay && m.isDayModeActive {
+		m.modes = m.nightModes
+		m.isDayModeActive = false
+		m.currentMode = m.modes[0]
+		m.currentMask = m.factory.CreateMask(m.currentMode)
+		m.lastSwitch = time.Now()
+		log.Printf("[MaskMixer] Time-based rotation: switched to NIGHT mode (hour: %d)", getHourOfDay())
+	}
 }
 
 func (m *MaskMixer) SetModes(modes []ProtocolMode) {
@@ -153,6 +238,7 @@ func (m *MaskMixer) SetModes(modes []ProtocolMode) {
 	m.packetsWrapped = 0
 	m.packetsUnwrapped = 0
 	m.errorsCount = 0
+	m.timeBasedEnabled = false
 }
 
 func (m *MaskMixer) AddMode(mode ProtocolMode) {
@@ -218,6 +304,8 @@ func (m *MaskMixer) GetCurrentMode() ProtocolMode {
 func (m *MaskMixer) GetCurrentMask() masks.Masker {
 	m.lock()
 	defer m.unlock()
+
+	m.checkTimeBasedRotation()
 
 	if m.switchInterval > 0 && time.Since(m.lastSwitch) > m.switchInterval {
 		m.rotate()
@@ -315,6 +403,9 @@ func (m *MaskMixer) GetStats() map[string]interface{} {
 		stats["next_rotation"] = time.Until(m.lastSwitch.Add(m.switchInterval)).String()
 		stats["switch_interval"] = m.switchInterval.String()
 	}
+	stats["time_based_enabled"] = m.timeBasedEnabled
+	stats["is_daytime"] = isDayTime()
+	stats["current_hour"] = getHourOfDay()
 
 	modeStats := make(map[string]int64)
 	for mode, count := range m.stats {
@@ -335,4 +426,52 @@ func (m *MaskMixer) GetSwitchInterval() time.Duration {
 	m.lock()
 	defer m.unlock()
 	return m.switchInterval
+}
+
+func (m *MaskMixer) SelectMaskForDomain(domain string) string {
+	if m.selector == nil {
+		return "webrtc"
+	}
+	return m.selector.Select(domain)
+}
+
+func (m *MaskMixer) SwitchToDomain(domain string) {
+	m.lock()
+	defer m.unlock()
+
+	maskName := m.SelectMaskForDomain(domain)
+
+	var newMode ProtocolMode
+	switch maskName {
+	case "vk":
+		newMode = ModeVK
+	case "rutube":
+		newMode = ModeRuTube
+	case "yandex":
+		newMode = ModeYandex
+	case "ozon":
+		newMode = ModeOzon
+	case "wildberries":
+		newMode = ModeWildberries
+	case "sberid":
+		newMode = ModeSberID
+	case "gosuslugi":
+		newMode = ModeGosuslugi
+	case "tls":
+		newMode = ModeTLS
+	case "quic":
+		newMode = ModeQUIC
+	case "webrtc":
+		fallthrough
+	default:
+		newMode = ModeWebRTC
+	}
+
+	if m.currentMode == newMode {
+		return
+	}
+
+	m.currentMode = newMode
+	m.currentMask = m.factory.CreateMask(newMode)
+	log.Printf("[MaskMixer] Switched to %s for domain %s", m.currentMode.String(), domain)
 }
