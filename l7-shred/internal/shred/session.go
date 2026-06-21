@@ -37,6 +37,7 @@ func (s SessionState) String() string {
 type SessionConfig struct {
 	SwitchInterval         time.Duration
 	Modes                  []ProtocolMode
+	CurrentMode            ProtocolMode
 	EnableReplayProtection bool
 	ReplayWindowSize       int
 }
@@ -89,6 +90,7 @@ func (sm *SessionManager) CreateSession() *Session {
 			ModeQUIC,
 			ModeTLS,
 		},
+		CurrentMode:            ModeVK,
 		EnableReplayProtection: true,
 		ReplayWindowSize:       64,
 	}
@@ -105,9 +107,11 @@ func (sm *SessionManager) CreateSession() *Session {
 
 	session.LocalMixer = NewMaskMixer(config.SwitchInterval)
 	session.LocalMixer.SetModes(config.Modes)
+	session.LocalMixer.SetCurrentMode(config.CurrentMode)
 
 	session.RemoteMixer = NewMaskMixer(config.SwitchInterval)
 	session.RemoteMixer.SetModes(config.Modes)
+	session.RemoteMixer.SetCurrentMode(config.CurrentMode)
 
 	sm.mu.Lock()
 	sm.sessions[id] = session
@@ -119,6 +123,10 @@ func (sm *SessionManager) CreateSession() *Session {
 func (sm *SessionManager) CreateSessionWithConfig(config *SessionConfig) *Session {
 	var id uint64
 	binary.Read(rand.Reader, binary.BigEndian, &id)
+
+	if config.CurrentMode == 0 {
+		config.CurrentMode = ModeVK
+	}
 
 	session := &Session{
 		ID:           id,
@@ -132,9 +140,11 @@ func (sm *SessionManager) CreateSessionWithConfig(config *SessionConfig) *Sessio
 
 	session.LocalMixer = NewMaskMixer(config.SwitchInterval)
 	session.LocalMixer.SetModes(config.Modes)
+	session.LocalMixer.SetCurrentMode(config.CurrentMode)
 
 	session.RemoteMixer = NewMaskMixer(config.SwitchInterval)
 	session.RemoteMixer.SetModes(config.Modes)
+	session.RemoteMixer.SetCurrentMode(config.CurrentMode)
 
 	sm.mu.Lock()
 	sm.sessions[id] = session

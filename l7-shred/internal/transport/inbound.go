@@ -62,6 +62,7 @@ func (i *Inbound) startReliableUDP() error {
 		return err
 	}
 	i.kcpListener = listener
+	log.Printf("[KCP] Server listening on %s with KCP", i.config.ListenAddr)
 	go i.kcpAcceptLoop()
 	return nil
 }
@@ -70,16 +71,19 @@ func (i *Inbound) kcpAcceptLoop() {
 	for {
 		kcpConn, err := i.kcpListener.AcceptKCP()
 		if err != nil {
+			log.Printf("[KCP] Accept error: %v", err)
 			return
 		}
 
-		kcpConn.SetStreamMode(true)
-		kcpConn.SetWindowSize(1024, 1024)
-		kcpConn.SetNoDelay(1, 20, 2, 1)
-		kcpConn.SetMtu(1350)
-		kcpConn.SetReadBuffer(4194304)
-		kcpConn.SetWriteBuffer(4194304)
+		kcpConn.SetStreamMode(false)
+		kcpConn.SetWindowSize(4096, 4096)
+		kcpConn.SetNoDelay(1, 10, 2, 1)
+		kcpConn.SetMtu(1400)
+		kcpConn.SetReadBuffer(16777216)
+		kcpConn.SetWriteBuffer(16777216)
+		kcpConn.SetACKNoDelay(true)
 
+		log.Printf("[KCP] New KCP connection from %s", kcpConn.RemoteAddr())
 		go i.handleConnection(kcpConn)
 	}
 }
@@ -90,7 +94,7 @@ func (i *Inbound) startTCP() error {
 		return err
 	}
 	i.listener = listener
-
+	log.Printf("[TCP] Server listening on %s", i.config.ListenAddr)
 	go i.acceptLoop()
 	return nil
 }
@@ -101,7 +105,7 @@ func (i *Inbound) startUDP() error {
 		return err
 	}
 	i.packetConn = packetConn
-
+	log.Printf("[UDP] Server listening on %s (raw UDP)", i.config.ListenAddr)
 	go i.packetLoop()
 	return nil
 }
@@ -126,9 +130,13 @@ func (i *Inbound) handleConnection(conn net.Conn) {
 		n, err := conn.Read(buf)
 		if err != nil {
 			if err != io.EOF {
-				return
+				log.Printf("[Inbound] Read error: %v", err)
 			}
 			return
+		}
+
+		if n == 1 && buf[0] == 0 {
+			continue
 		}
 
 		decrypted, err := i.cipher.Decrypt(buf[:n])
@@ -171,7 +179,7 @@ func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
 		wrapper = &UDPConnWrapper{
 			conn:       i.packetConn,
 			remoteAddr: addr,
-			readChan:   make(chan []byte, 100),
+			readChan:   make(chan []byte, 5000),
 		}
 		i.udpMu.Lock()
 		i.udpConns[addrStr] = wrapper
@@ -181,7 +189,6 @@ func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
 	select {
 	case wrapper.readChan <- data:
 	default:
-		log.Printf("[UDP] Dropping packet from %s (channel full)", addrStr)
 	}
 }
 
@@ -205,7 +212,6 @@ func (i *Inbound) acceptUDP() (net.Conn, error) {
 			select {
 			case data := <-wrapper.readChan:
 				i.udpMu.RUnlock()
-				log.Printf("[UDP] Accepting connection from %s", addrStr)
 				return &UDPConn{
 					wrapper:    wrapper,
 					remoteAddr: wrapper.remoteAddr,
@@ -251,7 +257,6 @@ type UDPConn struct {
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	readData   []byte
-	readBuffer []byte
 	closed     bool
 	mu         sync.RWMutex
 }

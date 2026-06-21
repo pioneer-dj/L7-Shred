@@ -4,6 +4,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/l7-shred/core/internal/crypto"
 	"github.com/l7-shred/core/internal/shred"
@@ -18,6 +19,9 @@ type Outbound struct {
 	session    *shred.Session
 	cipher     *crypto.AEADCipher
 	mu         sync.RWMutex
+	writeCh    chan []byte
+	closeCh    chan struct{}
+	wg         sync.WaitGroup
 }
 
 func NewOutbound(config *Config) (*Outbound, error) {
@@ -34,6 +38,8 @@ func NewOutbound(config *Config) (*Outbound, error) {
 		config:  config,
 		session: session,
 		cipher:  cipher,
+		writeCh: make(chan []byte, 5000),
+		closeCh: make(chan struct{}),
 	}, nil
 }
 
@@ -76,25 +82,81 @@ func (o *Outbound) connectUDP() error {
 }
 
 func (o *Outbound) connectReliableUDP() error {
-	log.Printf("[ReliableUDP] Connecting to %s", o.config.ServerAddr)
+    log.Printf("[ReliableUDP] Connecting to %s", o.config.ServerAddr)
 
-	kcpConn, err := kcp.DialWithOptions(o.config.ServerAddr, nil, 10, 3)
-	if err != nil {
-		return err
+    windowSize := 1024
+    if o.config.WindowSize > 0 {
+        windowSize = o.config.WindowSize
+    }
+
+    readBuffer := 4194304
+    if o.config.ReadBuffer > 0 {
+        readBuffer = o.config.ReadBuffer
+    }
+
+    writeBuffer := 4194304
+    if o.config.WriteBuffer > 0 {
+        writeBuffer = o.config.WriteBuffer
+    }
+
+    kcpConn, err := kcp.DialWithOptions(o.config.ServerAddr, nil, 10, 3)
+    if err != nil {
+        return err
+    }
+
+    kcpConn.SetStreamMode(false)
+    kcpConn.SetWindowSize(windowSize, windowSize)
+    kcpConn.SetNoDelay(1, 10, 2, 1)
+    kcpConn.SetMtu(o.config.MTU)
+    kcpConn.SetReadBuffer(readBuffer)
+    kcpConn.SetWriteBuffer(writeBuffer)
+    kcpConn.SetACKNoDelay(true)
+
+    o.packetConn = kcpConn
+    o.remoteAddr = kcpConn.RemoteAddr()
+
+    o.wg.Add(1)
+    go o.writeLoop()
+
+    log.Printf("[ReliableUDP] Connected (window=%d, buffer=%d, mtu=%d)", 
+        windowSize, readBuffer, o.config.MTU)
+    return nil
+}
+
+func (o *Outbound) keepAliveLoop(conn net.Conn) {
+	defer o.wg.Done()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-o.closeCh:
+			return
+		case <-ticker.C:
+			_, err := conn.Write([]byte{0})
+			if err != nil {
+				log.Printf("[KeepAlive] Write error: %v", err)
+			}
+		}
 	}
+}
 
-	kcpConn.SetStreamMode(true)
-	kcpConn.SetWindowSize(1024, 1024)
-	kcpConn.SetNoDelay(1, 20, 2, 1)
-	kcpConn.SetMtu(1350)
-	kcpConn.SetReadBuffer(4194304)
-	kcpConn.SetWriteBuffer(4194304)
+func (o *Outbound) writeLoop() {
+	defer o.wg.Done()
 
-	o.packetConn = kcpConn
-	o.remoteAddr = kcpConn.RemoteAddr()
-
-	log.Printf("[ReliableUDP] Connected to %s with KCP", o.config.ServerAddr)
-	return nil
+	for {
+		select {
+		case <-o.closeCh:
+			return
+		case data := <-o.writeCh:
+			if o.packetConn == nil {
+				continue
+			}
+			_, err := o.packetConn.Write(data)
+			if err != nil {
+				log.Printf("[Outbound] Write error: %v", err)
+			}
+		}
+	}
 }
 
 func (o *Outbound) Write(data []byte) (int, error) {
@@ -102,12 +164,20 @@ func (o *Outbound) Write(data []byte) (int, error) {
 		return o.conn.Write(data)
 	}
 	if o.packetConn != nil {
-		return o.packetConn.Write(data)
+		select {
+		case o.writeCh <- data:
+			return len(data), nil
+		default:
+			return 0, nil
+		}
 	}
 	return 0, net.ErrClosed
 }
 
 func (o *Outbound) Close() error {
+	close(o.closeCh)
+	o.wg.Wait()
+
 	if o.conn != nil {
 		o.conn.Close()
 	}

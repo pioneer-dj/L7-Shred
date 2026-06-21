@@ -37,8 +37,14 @@ type Config struct {
 	TLSSNI           string        `json:"tls_sni"`
 	TLSCertFetch     bool          `json:"tls_cert_fetch"`
 	ReliableUDP      bool          `json:"reliable_udp"`
+	SplitTunnel      bool          `json:"split_tunnel"`
 	CongestionCtrl   bool          `json:"congestion_control"`
 	MaxCwnd          int           `json:"max_cwnd"`
+	Modes          []string `json:"modes"`
+    SwitchInterval int      `json:"switch_interval"`
+	WindowSize  int `json:"window_size"`
+    ReadBuffer  int `json:"read_buffer"`
+    WriteBuffer int `json:"write_buffer"`
 
 	OnPacket func([]byte) `json:"-"`
 }
@@ -47,8 +53,8 @@ func DefaultConfig() *Config {
 	return &Config{
 		ServerAddr:       "",
 		ListenAddr:       ":8443",
-		Mode:             "tcp",
-		Protocol:         "tcp",
+		Mode:             "udp",
+		Protocol:         "udp",
 		Cipher:           "aes-256-gcm",
 		PostQuantum:      false,
 		MTU:              1350,
@@ -73,6 +79,7 @@ func DefaultConfig() *Config {
 		TLSSNI:           "www.google.com",
 		TLSCertFetch:     true,
 		ReliableUDP:      true,
+		SplitTunnel:      true,
 		CongestionCtrl:   true,
 		MaxCwnd:          65535,
 	}

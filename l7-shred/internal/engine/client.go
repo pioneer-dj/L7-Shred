@@ -2,15 +2,20 @@ package engine
 
 import (
 	"crypto/rand"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
+	"github.com/l7-shred/core/internal/tun"
 )
 
 type Client struct {
@@ -32,14 +37,21 @@ type Client struct {
 	bytesRecv    uint64
 	onPacket     func([]byte)
 
-	handshakeChan   chan []byte
-	handshakeErr    chan error
-	handshakeDone   bool
-	tunAdded        bool
-	currentDomain   string
-	background      *BackgroundTraffic
-	originalGateway string
-	originalIfIdx   string
+	handshakeChan    chan []byte
+	handshakeErr     chan error
+	handshakeDone    bool
+	tunAdded         bool
+	currentDomain    string
+	background       *BackgroundTraffic
+	originalGateway  string
+	originalIfIdx    string
+	splitTunnel      bool
+	defaultGateway   string
+	defaultInterface string
+	tunInterface     string
+	tunIndex         int
+	serverIP         string
+	serverPort       string
 }
 
 type ClientConfig struct {
@@ -60,6 +72,8 @@ type ClientConfig struct {
 	BackgroundEnabled      bool
 	BackgroundInterval     time.Duration
 	ReliableUDP            bool
+	SplitTunnel            bool
+	TUNInterface           string
 }
 
 func DefaultClientConfig(serverAddr string) *ClientConfig {
@@ -97,6 +111,8 @@ func DefaultClientConfig(serverAddr string) *ClientConfig {
 		BackgroundEnabled:      true,
 		BackgroundInterval:     30 * time.Second,
 		ReliableUDP:            true,
+		SplitTunnel:            true,
+		TUNInterface:           "l7shred",
 	}
 }
 
@@ -124,13 +140,19 @@ func NewClient(config *ClientConfig) *Client {
 	config.TransportConfig.ReliableUDP = config.ReliableUDP
 	config.TransportConfig.Protocol = "udp"
 
-	log.Printf("[DEBUG] AuthKey length: %d", len(config.AuthKey))
-	log.Printf("[DEBUG] Cipher: %s", config.Cipher)
+	log.Printf("[DEBUG] SplitTunnel: %v", config.SplitTunnel)
 	log.Printf("[DEBUG] ReliableUDP: %v", config.ReliableUDP)
 
 	if len(config.AuthKey) == 0 {
 		log.Printf("[ERROR] AuthKey is empty! Cannot start client.")
 		return nil
+	}
+
+	serverHost := strings.Split(config.TransportConfig.ServerAddr, ":")
+	serverIP := serverHost[0]
+	serverPort := "8443"
+	if len(serverHost) > 1 {
+		serverPort = serverHost[1]
 	}
 
 	sessionMgr := shred.NewSessionManager()
@@ -159,6 +181,10 @@ func NewClient(config *ClientConfig) *Client {
 		handshakeDone: false,
 		tunAdded:      false,
 		currentDomain: "",
+		splitTunnel:   config.SplitTunnel,
+		tunInterface:  config.TUNInterface,
+		serverIP:      serverIP,
+		serverPort:    serverPort,
 	}
 
 	if config.BackgroundEnabled {
@@ -184,6 +210,10 @@ func (c *Client) Start() error {
 
 	log.Printf("[Client] Starting client with session ID: %d", c.session.ID)
 
+	if err := c.saveDefaultRoute(); err != nil {
+		log.Printf("[Client] Warning: Could not save default route: %v", err)
+	}
+
 	outbound, err := transport.NewOutbound(c.config)
 	if err != nil {
 		log.Printf("[Client] NewOutbound error: %v", err)
@@ -199,6 +229,14 @@ func (c *Client) Start() error {
 	}
 	log.Printf("[Client] Connect() successful")
 
+	if conn := c.outbound.Conn(); conn != nil {
+		if udpConn, ok := conn.(*net.UDPConn); ok {
+			udpConn.SetReadBuffer(4 * 1024 * 1024)
+			udpConn.SetWriteBuffer(4 * 1024 * 1024)
+			log.Printf("[Client] UDP buffers increased to 4MB")
+		}
+	}
+
 	c.wg.Add(1)
 	go c.readLoop()
 
@@ -213,6 +251,161 @@ func (c *Client) Start() error {
 
 	log.Printf("[Client] Connected successfully, using mode: %s", c.mixer.GetCurrentMode().String())
 
+	if err := c.setupRouting(); err != nil {
+		log.Printf("[Client] Routing setup warning: %v", err)
+	}
+
+	return nil
+}
+
+func (c *Client) setupRouting() error {
+	log.Printf("[Client] Setting up routing...")
+
+	switch runtime.GOOS {
+	case "windows":
+		return c.setupWindowsRouting()
+	case "linux":
+		return c.setupLinuxRouting()
+	case "darwin":
+		return c.setupDarwinRouting()
+	default:
+		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	}
+}
+
+func (c *Client) getTUNInterfaceIndex() error {
+	out, err := exec.Command("netsh", "interface", "ip", "show", "interfaces").Output()
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, c.tunInterface) || strings.Contains(line, "l7shred") {
+			fields := strings.Fields(line)
+			for _, field := range fields {
+				if idx, err := strconv.Atoi(field); err == nil && idx > 0 && idx < 1000 {
+					c.tunIndex = idx
+					log.Printf("[Windows] Found TUN interface with index %d", c.tunIndex)
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("TUN interface not found")
+}
+
+func (c *Client) setupWindowsRouting() error {
+	log.Printf("[Windows] Configuring routes...")
+
+	c.getTUNInterfaceIndex()
+
+	exec.Command("cmd", "/c", "route delete 0.0.0.0").Run()
+
+	routeCmd := fmt.Sprintf("route add %s mask 255.255.255.255 %s metric 1", c.serverIP, c.defaultGateway)
+	if err := exec.Command("cmd", "/c", routeCmd).Run(); err != nil {
+		log.Printf("[Windows] Failed to add server route: %v", err)
+	}
+
+	var defaultRouteCmd string
+	if c.tunIndex > 0 {
+		defaultRouteCmd = fmt.Sprintf("route add 0.0.0.0 mask 0.0.0.0 10.0.0.1 metric 1 IF %d", c.tunIndex)
+	} else {
+		defaultRouteCmd = "route add 0.0.0.0 mask 0.0.0.0 10.0.0.1 metric 1"
+	}
+
+	if err := exec.Command("cmd", "/c", defaultRouteCmd).Run(); err != nil {
+		log.Printf("[Windows] Failed to add default route: %v", err)
+	} else {
+		log.Printf("[Windows] Default route added via TUN (metric 1)")
+	}
+
+	if c.splitTunnel {
+		c.addRussianSubnetRoutes()
+	}
+
+	return nil
+}
+
+func (c *Client) addRussianSubnetRoutes() {
+	log.Printf("[Windows] Adding Russian subnet routes...")
+
+	added := 0
+	for _, subnet := range tun.RussianSubnets {
+		cmd := fmt.Sprintf("route add %s %s metric 1000", subnet, c.defaultGateway)
+		if err := exec.Command("cmd", "/c", cmd).Run(); err == nil {
+			added++
+		}
+	}
+	log.Printf("[Windows] Added %d Russian subnet routes", added)
+}
+
+func (c *Client) setupLinuxRouting() error {
+	log.Printf("[Linux] Configuring routes...")
+
+	exec.Command("ip", "route", "del", "default").Run()
+	exec.Command("ip", "route", "add", c.serverIP, "via", c.defaultGateway, "dev", c.defaultInterface).Run()
+	exec.Command("ip", "route", "add", "default", "via", "10.0.0.1", "dev", "tun0", "metric", "1").Run()
+
+	if c.splitTunnel {
+		added := 0
+		for _, subnet := range tun.RussianSubnets {
+			if err := exec.Command("ip", "route", "add", subnet, "via", c.defaultGateway, "dev", c.defaultInterface, "metric", "1000").Run(); err == nil {
+				added++
+			}
+		}
+		log.Printf("[Linux] Added %d Russian subnet routes", added)
+	}
+
+	return nil
+}
+
+func (c *Client) setupDarwinRouting() error {
+	log.Printf("[Darwin] Configuring routes...")
+
+	exec.Command("route", "delete", "default").Run()
+	exec.Command("route", "add", c.serverIP, c.defaultGateway).Run()
+	exec.Command("route", "add", "default", "10.0.0.1").Run()
+
+	if c.splitTunnel {
+		for _, subnet := range tun.RussianSubnets {
+			exec.Command("route", "add", "-net", subnet, c.defaultGateway).Run()
+		}
+	}
+
+	return nil
+}
+
+func (c *Client) saveDefaultRoute() error {
+	switch runtime.GOOS {
+	case "windows":
+		out, err := exec.Command("route", "print", "0.0.0.0").Output()
+		if err != nil {
+			return err
+		}
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "0.0.0.0") && strings.Contains(line, "0.0.0.0") {
+				fields := strings.Fields(line)
+				if len(fields) >= 3 {
+					c.defaultGateway = fields[2]
+					log.Printf("[Client] Found default gateway: %s", c.defaultGateway)
+					break
+				}
+			}
+		}
+	case "linux", "darwin":
+		out, err := exec.Command("ip", "route", "show", "default").Output()
+		if err != nil {
+			return err
+		}
+		fields := strings.Fields(string(out))
+		if len(fields) >= 3 {
+			c.defaultGateway = fields[2]
+			c.defaultInterface = fields[4]
+			log.Printf("[Client] Found default gateway: %s on interface: %s", c.defaultGateway, c.defaultInterface)
+		}
+	}
 	return nil
 }
 
@@ -236,10 +429,12 @@ func (c *Client) performHandshake() error {
 		conn,
 		c.mixer.GetSwitchInterval(),
 		c.mixer.GetModes(),
+		c.mixer.GetCurrentMode(),
 		c.handshakeChan,
 		c.handshakeErr,
 		timeout,
 	)
+
 	if err != nil {
 		log.Printf("[Client] Handshake failed: %v", err)
 		return err
@@ -255,70 +450,99 @@ func (c *Client) performHandshake() error {
 
 func (c *Client) getConn() net.Conn {
 	if c.outbound == nil {
-		log.Printf("[Client] getConn: outbound is nil")
 		return nil
 	}
-	conn := c.outbound.Conn()
-	if conn == nil {
-		log.Printf("[Client] getConn: outbound.Conn() returned nil")
+	return c.outbound.Conn()
+}
+
+func (c *Client) reconnect() error {
+	log.Printf("[Client] Attempting to reconnect...")
+
+	c.mu.Lock()
+	c.connected = false
+	c.handshakeDone = false
+	c.mu.Unlock()
+
+	if c.outbound != nil {
+		c.outbound.Close()
+		c.outbound = nil
 	}
-	return conn
+
+	time.Sleep(1 * time.Second)
+
+	outbound, err := transport.NewOutbound(c.config)
+	if err != nil {
+		return err
+	}
+	c.outbound = outbound
+
+	if err := c.outbound.Connect(); err != nil {
+		return err
+	}
+
+	if conn := c.outbound.Conn(); conn != nil {
+		if udpConn, ok := conn.(*net.UDPConn); ok {
+			udpConn.SetReadBuffer(4 * 1024 * 1024)
+			udpConn.SetWriteBuffer(4 * 1024 * 1024)
+		}
+	}
+
+	if err := c.performHandshake(); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	c.connected = true
+	c.handshakeDone = true
+	c.mu.Unlock()
+
+	log.Printf("[Client] Reconnected successfully")
+	return nil
 }
 
 func (c *Client) readLoop() {
 	defer c.wg.Done()
-	log.Printf("[Client] readLoop started")
 
 	buf := make([]byte, 65536)
 
 	for {
 		select {
 		case <-c.stopChan:
-			log.Printf("[Client] readLoop: stop signal received")
 			return
 		default:
 		}
 
 		conn := c.getConn()
 		if conn == nil {
-			log.Printf("[Client] readLoop: conn is nil, exiting")
-			return
+			time.Sleep(1 * time.Second)
+			continue
 		}
 
-		if !c.handshakeDone {
-			n, err := conn.Read(buf)
-			if err != nil {
-				if c.connected {
-					log.Printf("[Client] Read error: %v", err)
-				}
-				return
-			}
-			data := make([]byte, n)
-			copy(data, buf[:n])
+		n, err := conn.Read(buf)
+		if err != nil {
+			log.Printf("[Client] Read error: %v, reconnecting...", err)
+			go c.reconnect()
+			time.Sleep(2 * time.Second)
+			continue
+		}
 
+		data := make([]byte, n)
+		copy(data, buf[:n])
+
+		if !c.handshakeDone {
 			select {
 			case c.handshakeChan <- data:
-				log.Printf("[Client] readLoop: sent %d bytes to handshake channel", n)
 			default:
-				log.Printf("[Client] readLoop: handshake channel full, dropping data")
 			}
 			continue
 		}
 
-		frame, err := readFrame(conn, buf)
-		if err != nil {
-			if c.connected {
-				log.Printf("[Client] Read error: %v", err)
-			}
-			return
-		}
-
 		c.mu.Lock()
 		c.packetsRecv++
-		c.bytesRecv += uint64(len(frame))
+		c.bytesRecv += uint64(n)
 		c.mu.Unlock()
 
-		go c.processIncomingPacket(frame)
+		go c.processIncomingPacket(data)
 	}
 }
 
@@ -435,7 +659,9 @@ func (c *Client) Send(payload []byte) error {
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return writeFrame(conn, wrapped)
+
+	_, err := conn.Write(wrapped)
+	return err
 }
 
 func (c *Client) SendTo(writer io.Writer, payload []byte) error {
@@ -460,6 +686,31 @@ func (c *Client) IsConnected() bool {
 	return c.connected
 }
 
+func (c *Client) removeRoutes() {
+	log.Printf("[Client] Removing routes...")
+
+	switch runtime.GOOS {
+	case "windows":
+		exec.Command("cmd", "/c", "route delete "+c.serverIP).Run()
+		exec.Command("cmd", "/c", "route delete 0.0.0.0").Run()
+		if c.defaultGateway != "" {
+			exec.Command("cmd", "/c", "route add 0.0.0.0 mask 0.0.0.0 "+c.defaultGateway+" metric 35").Run()
+		}
+	case "linux":
+		exec.Command("ip", "route", "del", c.serverIP).Run()
+		exec.Command("ip", "route", "del", "default", "via", "10.0.0.1").Run()
+		if c.defaultGateway != "" && c.defaultInterface != "" {
+			exec.Command("ip", "route", "add", "default", "via", c.defaultGateway, "dev", c.defaultInterface).Run()
+		}
+	case "darwin":
+		exec.Command("route", "delete", c.serverIP).Run()
+		exec.Command("route", "delete", "default", "10.0.0.1").Run()
+		if c.defaultGateway != "" {
+			exec.Command("route", "add", "default", c.defaultGateway).Run()
+		}
+	}
+}
+
 func (c *Client) Stop() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -474,11 +725,7 @@ func (c *Client) Stop() error {
 		c.background.Stop()
 	}
 
-	if c.tunAdded {
-		cmd := exec.Command("route", "delete", "0.0.0.0")
-		cmd.Run()
-		log.Printf("[Client] Removed default route")
-	}
+	c.removeRoutes()
 
 	close(c.stopChan)
 	c.wg.Wait()
@@ -508,6 +755,7 @@ func (c *Client) GetStats() map[string]interface{} {
 
 	stats := make(map[string]interface{})
 	stats["connected"] = c.connected
+	stats["split_tunnel"] = c.splitTunnel
 	stats["session_id"] = c.session.ID
 	stats["session_state"] = c.session.State.String()
 	stats["packets_sent"] = c.packetsSent
@@ -551,4 +799,10 @@ func (c *Client) SetTunAdded(added bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.tunAdded = added
+}
+
+func (c *Client) SetSplitTunnel(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.splitTunnel = enabled
 }

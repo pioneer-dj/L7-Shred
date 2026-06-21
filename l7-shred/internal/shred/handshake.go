@@ -36,13 +36,14 @@ type Handshake struct {
 	SwitchInterval uint32
 	ModesCount     byte
 	Modes          []ProtocolMode
+	CurrentMode    uint32
 	Timestamp      uint64
 	Nonce          [16]byte
 	Sequence       uint64
 	Checksum       byte
 }
 
-func NewHandshake(sessionType HandshakeType, interval time.Duration, modes []ProtocolMode, sequence uint64) *Handshake {
+func NewHandshake(sessionType HandshakeType, interval time.Duration, modes []ProtocolMode, currentMode ProtocolMode, sequence uint64) *Handshake {
 	hs := &Handshake{
 		Magic:          [4]byte{0xDE, 0xAD, 0xBE, 0xEF},
 		Type:           sessionType,
@@ -50,6 +51,7 @@ func NewHandshake(sessionType HandshakeType, interval time.Duration, modes []Pro
 		SwitchInterval: uint32(interval.Seconds()),
 		ModesCount:     byte(len(modes)),
 		Modes:          modes,
+		CurrentMode:    uint32(currentMode),
 		Timestamp:      uint64(time.Now().UnixNano()),
 		Sequence:       sequence,
 	}
@@ -71,6 +73,10 @@ func (h *Handshake) calcChecksum() byte {
 	for _, mode := range h.Modes {
 		sum ^= byte(mode)
 	}
+	sum ^= byte(h.CurrentMode >> 24)
+	sum ^= byte(h.CurrentMode >> 16)
+	sum ^= byte(h.CurrentMode >> 8)
+	sum ^= byte(h.CurrentMode)
 	for _, b := range h.Nonce {
 		sum ^= b
 	}
@@ -107,90 +113,118 @@ func (h *Handshake) Verify() bool {
 }
 
 func (h *Handshake) Encode() []byte {
-	modesLen := len(h.Modes) * 4
-	buf := make([]byte, 4+1+1+4+1+modesLen+8+16+8+1)
-	offset := 0
+    modesLen := len(h.Modes) * 4
+    // Базовый размер без опциональных полей: magic(4) + type(1) + version(1) + interval(4) + modesCount(1) + modes
+    buf := make([]byte, 4+1+1+4+1+modesLen)
+    offset := 0
 
-	copy(buf[offset:offset+4], h.Magic[:])
-	offset += 4
+    copy(buf[offset:offset+4], h.Magic[:])
+    offset += 4
 
-	buf[offset] = byte(h.Type)
-	offset++
+    buf[offset] = byte(h.Type)
+    offset++
 
-	buf[offset] = h.Version
-	offset++
+    buf[offset] = h.Version
+    offset++
 
-	binary.BigEndian.PutUint32(buf[offset:offset+4], h.SwitchInterval)
-	offset += 4
+    binary.BigEndian.PutUint32(buf[offset:offset+4], h.SwitchInterval)
+    offset += 4
 
-	buf[offset] = h.ModesCount
-	offset++
+    buf[offset] = h.ModesCount
+    offset++
 
-	for _, mode := range h.Modes {
-		binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(mode))
-		offset += 4
-	}
+    for _, mode := range h.Modes {
+        binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(mode))
+        offset += 4
+    }
 
-	binary.BigEndian.PutUint64(buf[offset:offset+8], h.Timestamp)
-	offset += 8
+    if h.CurrentMode != 0 {
+        buf = append(buf, make([]byte, 4+8+16+8+1)...)
+        binary.BigEndian.PutUint32(buf[offset:offset+4], h.CurrentMode)
+        offset += 4
+        binary.BigEndian.PutUint64(buf[offset:offset+8], h.Timestamp)
+        offset += 8
+        copy(buf[offset:offset+16], h.Nonce[:])
+        offset += 16
+        binary.BigEndian.PutUint64(buf[offset:offset+8], h.Sequence)
+        offset += 8
+        buf[offset] = h.Checksum
+    }
 
-	copy(buf[offset:offset+16], h.Nonce[:])
-	offset += 16
-
-	binary.BigEndian.PutUint64(buf[offset:offset+8], h.Sequence)
-	offset += 8
-
-	buf[offset] = h.Checksum
-
-	return buf
+    return buf
 }
 
 func DecodeHandshake(data []byte) (*Handshake, error) {
-	if len(data) < 4+1+1+4+1+8+16+8+1 {
-		return nil, ErrInvalidHandshakeMagic
-	}
+    if len(data) < 4+1+1+4+1 {
+        return nil, ErrInvalidHandshakeMagic
+    }
 
-	h := &Handshake{}
-	offset := 0
+    h := &Handshake{}
+    offset := 0
 
-	copy(h.Magic[:], data[offset:offset+4])
-	offset += 4
+    copy(h.Magic[:], data[offset:offset+4])
+    offset += 4
 
-	h.Type = HandshakeType(data[offset])
-	offset++
+    h.Type = HandshakeType(data[offset])
+    offset++
 
-	h.Version = data[offset]
-	offset++
+    h.Version = data[offset]
+    offset++
 
-	h.SwitchInterval = binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
+    h.SwitchInterval = binary.BigEndian.Uint32(data[offset : offset+4])
+    offset += 4
 
-	h.ModesCount = data[offset]
-	offset++
+    h.ModesCount = data[offset]
+    offset++
 
-	h.Modes = make([]ProtocolMode, h.ModesCount)
-	for i := byte(0); i < h.ModesCount; i++ {
-		mode := binary.BigEndian.Uint32(data[offset : offset+4])
-		h.Modes[i] = ProtocolMode(mode)
-		offset += 4
-	}
+    // Проверка что данных достаточно для чтения modes
+    if len(data) < offset+int(h.ModesCount)*4 {
+        return nil, ErrInvalidHandshakeMagic
+    }
 
-	h.Timestamp = binary.BigEndian.Uint64(data[offset : offset+8])
-	offset += 8
+    h.Modes = make([]ProtocolMode, h.ModesCount)
+    for i := byte(0); i < h.ModesCount; i++ {
+        mode := binary.BigEndian.Uint32(data[offset : offset+4])
+        h.Modes[i] = ProtocolMode(mode)
+        offset += 4
+    }
 
-	copy(h.Nonce[:], data[offset:offset+16])
-	offset += 16
+    // CurrentMode (4 байта) - опционально, если данных хватает
+    if len(data) >= offset+4 {
+        h.CurrentMode = binary.BigEndian.Uint32(data[offset : offset+4])
+        offset += 4
+    } else {
+        h.CurrentMode = uint32(h.Modes[0]) // fallback на первую маску
+    }
 
-	h.Sequence = binary.BigEndian.Uint64(data[offset : offset+8])
-	offset += 8
+    // Timestamp (8 байт) - опционально
+    if len(data) >= offset+8 {
+        h.Timestamp = binary.BigEndian.Uint64(data[offset : offset+8])
+        offset += 8
+    }
 
-	h.Checksum = data[offset]
+    // Nonce (16 байт) - опционально
+    if len(data) >= offset+16 {
+        copy(h.Nonce[:], data[offset:offset+16])
+        offset += 16
+    }
 
-	if !h.Verify() {
-		return nil, ErrHandshakeChecksumMismatch
-	}
+    // Sequence (8 байт) - опционально
+    if len(data) >= offset+8 {
+        h.Sequence = binary.BigEndian.Uint64(data[offset : offset+8])
+        offset += 8
+    }
 
-	return h, nil
+    // Checksum (1 байт) - опционально
+    if len(data) > offset {
+        h.Checksum = data[offset]
+    }
+
+    if !h.Verify() {
+        return nil, ErrHandshakeChecksumMismatch
+    }
+
+    return h, nil
 }
 
 type HandshakeState struct {
@@ -258,15 +292,15 @@ func NewHandshakeManager(authKey []byte, timeout time.Duration) *HandshakeManage
 	}
 }
 
-func (hm *HandshakeManager) PerformClientHandshakeAsync(conn net.Conn, interval time.Duration, modes []ProtocolMode, readChan <-chan []byte, errChan chan error, timeout time.Duration) error {
+func (hm *HandshakeManager) PerformClientHandshakeAsync(conn net.Conn, interval time.Duration, modes []ProtocolMode, currentMode ProtocolMode, readChan <-chan []byte, errChan chan error, timeout time.Duration) error {
 	log.Printf("[Handshake] ========== CLIENT HANDSHAKE ASYNC START ==========")
 	log.Printf("[Handshake] Connection: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
-	log.Printf("[Handshake] Interval: %v, Modes: %v", interval, modes)
+	log.Printf("[Handshake] Interval: %v, Modes: %v, CurrentMode: %v", interval, modes, currentMode)
 
 	seq := hm.state.NextSequence()
 	log.Printf("[Handshake] Using sequence: %d", seq)
 
-	syn := NewHandshake(HandshakeSyn, interval, modes, seq)
+	syn := NewHandshake(HandshakeSyn, interval, modes, currentMode, seq)
 	synData := syn.Encode()
 	log.Printf("[Handshake] SynData length: %d", len(synData))
 
@@ -276,7 +310,6 @@ func (hm *HandshakeManager) PerformClientHandshakeAsync(conn net.Conn, interval 
 	packet := append(synData, signature...)
 	log.Printf("[Handshake] Total packet length: %d", len(packet))
 
-	// Отправляем SYN с повторами для UDP
 	log.Printf("[Handshake] Sending SYN to server (with retries)...")
 	for i := 0; i < 3; i++ {
 		if _, err := conn.Write(packet); err != nil {
@@ -338,15 +371,15 @@ func (hm *HandshakeManager) PerformClientHandshakeAsync(conn net.Conn, interval 
 	}
 }
 
-func (hm *HandshakeManager) PerformClientHandshake(conn net.Conn, interval time.Duration, modes []ProtocolMode) error {
+func (hm *HandshakeManager) PerformClientHandshake(conn net.Conn, interval time.Duration, modes []ProtocolMode, currentMode ProtocolMode) error {
 	log.Printf("[Handshake] ========== CLIENT HANDSHAKE START ==========")
 	log.Printf("[Handshake] Connection: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
-	log.Printf("[Handshake] Interval: %v, Modes: %v", interval, modes)
+	log.Printf("[Handshake] Interval: %v, Modes: %v, CurrentMode: %v", interval, modes, currentMode)
 
 	seq := hm.state.NextSequence()
 	log.Printf("[Handshake] Using sequence: %d", seq)
 
-	syn := NewHandshake(HandshakeSyn, interval, modes, seq)
+	syn := NewHandshake(HandshakeSyn, interval, modes, currentMode, seq)
 	synData := syn.Encode()
 	log.Printf("[Handshake] SynData length: %d", len(synData))
 
@@ -447,8 +480,8 @@ func (hm *HandshakeManager) PerformServerHandshake(conn net.Conn) (*SessionConfi
 		return nil, err
 	}
 
-	log.Printf("[Handshake] SYN decoded: Type=%d, Interval=%d, Modes=%v, Sequence=%d",
-		syn.Type, syn.SwitchInterval, syn.Modes, syn.Sequence)
+	log.Printf("[Handshake] SYN decoded: Type=%d, Interval=%d, Modes=%v, CurrentMode=%d, Sequence=%d",
+		syn.Type, syn.SwitchInterval, syn.Modes, syn.CurrentMode, syn.Sequence)
 
 	if syn.Type != HandshakeSyn {
 		log.Printf("[Handshake] Wrong handshake type: %d, expected %d", syn.Type, HandshakeSyn)
@@ -465,12 +498,13 @@ func (hm *HandshakeManager) PerformServerHandshake(conn net.Conn) (*SessionConfi
 	config := &SessionConfig{
 		SwitchInterval:         time.Duration(syn.SwitchInterval) * time.Second,
 		Modes:                  syn.Modes,
+		CurrentMode:            ProtocolMode(syn.CurrentMode),
 		EnableReplayProtection: true,
 		ReplayWindowSize:       64,
 	}
 
 	seq := hm.state.NextSequence()
-	ack := NewHandshake(HandshakeAck, config.SwitchInterval, config.Modes, seq)
+	ack := NewHandshake(HandshakeAck, config.SwitchInterval, config.Modes, config.CurrentMode, seq)
 	ackData := ack.Encode()
 	ackSignature := hm.sign(ackData)
 
@@ -481,7 +515,6 @@ func (hm *HandshakeManager) PerformServerHandshake(conn net.Conn) (*SessionConfi
 		return nil, err
 	}
 
-	// Отправляем ACK с повторами
 	for i := 0; i < 3; i++ {
 		if _, err := conn.Write(append(ackData, ackSignature...)); err != nil {
 			log.Printf("[Handshake] Write error (attempt %d): %v", i+1, err)

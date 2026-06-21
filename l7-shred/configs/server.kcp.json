@@ -1,6 +1,6 @@
 {
-  "server": "your-server.com:8443",
-  "listen": "",
+  "listen": "0.0.0.0:8443",
+  "server": "",
   "mode": "udp",
   "protocol": "udp",
   "secret_key": "UaCz7uGxL8sD2fH9jK4lQ1wE5rT7yU3i",
@@ -30,6 +30,5 @@
   "tls_cert_fetch": true,
   "reliable_udp": true,
   "congestion_control": true,
-  "max_cwnd": 65535,
-  "split_tunnel": true
+  "max_cwnd": 65535
 }

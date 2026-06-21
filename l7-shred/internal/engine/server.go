@@ -153,6 +153,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	session := s.sessionManager.CreateSessionWithConfig(config)
 
+	s.logger.Printf("Session %d established with modes: %v, current mode: %v, interval: %v",
+		session.ID, config.Modes, config.CurrentMode, config.SwitchInterval)
+
 	serverConn := &ServerConnection{
 		ID:        session.ID,
 		Conn:      conn,
@@ -173,8 +176,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}()
 
 	session.State = shred.SessionStateEstablished
-	s.logger.Printf("Session %d established with modes: %v, interval: %v",
-		session.ID, config.Modes, config.SwitchInterval)
+	session.SyncModes()
 
 	s.handleDataExchange(serverConn)
 }

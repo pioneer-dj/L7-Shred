@@ -65,7 +65,11 @@ func (t *TLSMask) generateFakeCert() []byte {
 
 func (t *TLSMask) Wrap(payload []byte) []byte {
 	if !t.handshakeDone && t.handshakeStep < 6 {
-		return t.simulateHandshake()
+		result := t.simulateHandshake()
+		if t.handshakeStep == 6 {
+			t.handshakeDone = true
+		}
+		return result
 	}
 
 	t.handshakeDone = true
@@ -279,15 +283,18 @@ func (t *TLSMask) Unwrap(data []byte) ([]byte, error) {
 	}
 
 	contentType := data[0]
+
 	if contentType == 0x16 || contentType == 0x17 || contentType == 0x14 {
 		recordLen := int(binary.BigEndian.Uint16(data[3:5]))
-		if len(data) < 5+recordLen {
-			return nil, ErrInvalidPacket
+		if len(data) >= 5+recordLen {
+			unwrapped := data[5 : 5+recordLen]
+			if len(unwrapped) > 0 {
+				return unwrapped, nil
+			}
 		}
-		return data[5 : 5+recordLen], nil
 	}
 
-	return data, nil
+	return nil, ErrInvalidPacket
 }
 
 func (t *TLSMask) ID() string { return "tls" }

@@ -181,9 +181,7 @@ func NewMaskMixer(switchInterval time.Duration) *MaskMixer {
 		nightModes:       nightModes,
 	}
 
-	mixer.mu <- struct{}{}
 	mixer.currentMask = mixer.factory.CreateMask(mixer.currentMode)
-	<-mixer.mu
 
 	return mixer
 }
@@ -348,37 +346,29 @@ func (m *MaskMixer) Wrap(payload []byte) []byte {
 }
 
 func (m *MaskMixer) Unwrap(data []byte) ([]byte, error) {
-	mask := m.GetCurrentMask()
-	result, err := mask.Unwrap(data)
+	m.lock()
+	defer m.unlock()
+
+	// Пробуем текущую маску
+	result, err := m.currentMask.Unwrap(data)
 	if err == nil {
-		m.lock()
 		m.packetsUnwrapped++
-		m.unlock()
 		return result, nil
 	}
 
-	m.lock()
-	modes := make([]ProtocolMode, len(m.modes))
-	copy(modes, m.modes)
-	m.unlock()
-
-	for _, mode := range modes {
+	// Перебираем все маски
+	for _, mode := range m.modes {
 		testMask := m.factory.CreateMask(mode)
 		result, err := testMask.Unwrap(data)
 		if err == nil {
-			m.lock()
 			m.currentMode = mode
 			m.currentMask = testMask
 			m.packetsUnwrapped++
-			m.unlock()
 			return result, nil
 		}
 	}
 
-	m.lock()
 	m.errorsCount++
-	m.unlock()
-
 	return nil, masks.ErrUnwrapFailed
 }
 
@@ -433,6 +423,15 @@ func (m *MaskMixer) SelectMaskForDomain(domain string) string {
 		return "webrtc"
 	}
 	return m.selector.Select(domain)
+}
+
+func (m *MaskMixer) SetCurrentMode(mode ProtocolMode) {
+	m.lock()
+	defer m.unlock()
+
+	m.currentMode = mode
+	m.currentMask = m.factory.CreateMask(mode)
+	log.Printf("[MaskMixer] Set current mode to %s", mode.String())
 }
 
 func (m *MaskMixer) SwitchToDomain(domain string) {
