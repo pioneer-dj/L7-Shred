@@ -37,8 +37,6 @@ type Client struct {
 	bytesRecv    uint64
 	onPacket     func([]byte)
 
-	handshakeChan    chan []byte
-	handshakeErr     chan error
 	handshakeDone    bool
 	tunAdded         bool
 	currentDomain    string
@@ -176,8 +174,6 @@ func NewClient(config *ClientConfig) *Client {
 		mixer:         mixer,
 		stopChan:      make(chan struct{}),
 		authKey:       config.AuthKey,
-		handshakeChan: make(chan []byte, 10),
-		handshakeErr:  make(chan error, 1),
 		handshakeDone: false,
 		tunAdded:      false,
 		currentDomain: "",
@@ -237,14 +233,14 @@ func (c *Client) Start() error {
 		}
 	}
 
-	c.wg.Add(1)
-	go c.readLoop()
-
 	if err := c.performHandshake(); err != nil {
 		log.Printf("[Client] performHandshake error: %v", err)
 		c.outbound.Close()
 		return err
 	}
+
+	c.wg.Add(1)
+	go c.readLoop()
 
 	c.connected = true
 	c.handshakeDone = true
@@ -420,19 +416,11 @@ func (c *Client) performHandshake() error {
 
 	log.Printf("[Client] Got connection, local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 
-	timeout := 10 * time.Second
-	if c.config.SessionTimeout > 0 {
-		timeout = time.Duration(c.config.SessionTimeout) * time.Second
-	}
-
-	err := c.handshakeMgr.PerformClientHandshakeAsync(
+	err := c.handshakeMgr.PerformClientHandshake(
 		conn,
 		c.mixer.GetSwitchInterval(),
 		c.mixer.GetModes(),
 		c.mixer.GetCurrentMode(),
-		c.handshakeChan,
-		c.handshakeErr,
-		timeout,
 	)
 
 	if err != nil {
@@ -518,6 +506,10 @@ func (c *Client) readLoop() {
 			continue
 		}
 
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			log.Printf("[Client] Failed to set read deadline: %v", err)
+		}
+
 		n, err := conn.Read(buf)
 		if err != nil {
 			log.Printf("[Client] Read error: %v, reconnecting...", err)
@@ -530,10 +522,6 @@ func (c *Client) readLoop() {
 		copy(data, buf[:n])
 
 		if !c.handshakeDone {
-			select {
-			case c.handshakeChan <- data:
-			default:
-			}
 			continue
 		}
 

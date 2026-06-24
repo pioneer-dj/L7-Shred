@@ -1,11 +1,35 @@
+# Binaries
 /bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Configs with secrets
 /configs/local/
-*.log
-*.pcap
 *.key
 *.crt
-.DS_Store
-*.swp
+config_work.json
+config_udp.json
+config_kcp.json
+config_*.json
+!config_*.example.json
+
+# Logs
+*.log
+*.pcap
+
+# Go
 *.test
 *.out
 coverage.out
+
+# IDE
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Temporary files
+*.tmp
+*.temp
