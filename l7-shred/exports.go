@@ -19,11 +19,12 @@ import (
 )
 
 var (
-	clientInstance *engine.Client
-	tunDevice      *tun.TunDevice
-	clientMutex    sync.Mutex
-	isRunning      bool
-	stopChan       chan struct{}
+	clientInstance  *engine.Client
+	tunDevice       *tun.TunDevice
+	clientMutex     sync.Mutex
+	isRunning       bool
+	stopChan        chan struct{}
+	currentServerIP string
 )
 
 type FlutterConfig struct {
@@ -79,6 +80,8 @@ func StartVPN(configJSON *C.char) *C.char {
 	if flutterConfig.Cipher == "" {
 		flutterConfig.Cipher = "aes-256-gcm"
 	}
+
+	currentServerIP = flutterConfig.Server
 
 	modes := make([]shred.ProtocolMode, 0, len(flutterConfig.Modes))
 	if len(flutterConfig.Modes) == 0 {
@@ -275,10 +278,7 @@ func GetStats() *C.char {
 	status := VPNStatus{
 		Status:   "connected",
 		ClientIP: "10.0.0.2",
-		ServerIP: "85.120.81.85",
-		Ping:     46,
-		SpeedIn:  1200,
-		SpeedOut: 800,
+		ServerIP: currentServerIP,
 	}
 
 	if bytesIn, ok := stats["bytes_recv"].(uint64); ok {
