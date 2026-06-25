@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -25,6 +26,9 @@ var (
 	isRunning       bool
 	stopChan        chan struct{}
 	currentServerIP string
+	lastStats       map[string]interface{}
+	stopOnce        sync.Once
+	tunReaderDone   chan struct{}
 )
 
 type FlutterConfig struct {
@@ -117,6 +121,20 @@ func StartVPN(configJSON *C.char) *C.char {
 		}
 	}
 
+	// Добавляем текущую директорию в PATH для wintun.dll
+	exePath, err := os.Executable()
+	if err == nil {
+		exeDir := filepath.Dir(exePath)
+		os.Setenv("PATH", os.Getenv("PATH")+";"+exeDir)
+		log.Printf("Added %s to PATH for wintun.dll", exeDir)
+	}
+
+	workDir, err := os.Getwd()
+	if err == nil {
+		os.Setenv("PATH", os.Getenv("PATH")+";"+workDir)
+		log.Printf("Added %s to PATH for wintun.dll", workDir)
+	}
+
 	clientConfig := &engine.ClientConfig{
 		TransportConfig: &transport.Config{
 			ServerAddr:      flutterConfig.Server,
@@ -197,11 +215,16 @@ func StartVPN(configJSON *C.char) *C.char {
 	log.Println("Client connected to server")
 
 	stopChan = make(chan struct{})
+	tunReaderDone = make(chan struct{})
 
+	// TUN reader goroutine
 	go func() {
+		defer close(tunReaderDone)
+		log.Println("TUN reader: started")
 		for {
 			select {
 			case <-stopChan:
+				log.Println("TUN reader: stop signal received")
 				return
 			default:
 			}
@@ -227,35 +250,63 @@ func StartVPN(configJSON *C.char) *C.char {
 
 	clientInstance = client
 	isRunning = true
+	stopOnce = sync.Once{}
 
 	return C.CString(`{"status":"connected"}`)
 }
 
 //export StopVPN
 func StopVPN() *C.char {
+	log.Println("StopVPN: called")
+
 	clientMutex.Lock()
 	defer clientMutex.Unlock()
 
 	if !isRunning {
+		log.Println("StopVPN: already stopped")
 		return C.CString(`{"status":"disconnected"}`)
 	}
 
-	if stopChan != nil {
-		close(stopChan)
-		stopChan = nil
-	}
+	// Используем sync.Once для предотвращения повторного закрытия
+	stopOnce.Do(func() {
+		log.Println("StopVPN: stopping VPN...")
 
-	if clientInstance != nil {
-		clientInstance.Stop()
-		clientInstance = nil
-	}
+		// 1. Сигналим TUN reader горутине о остановке
+		if stopChan != nil {
+			log.Println("StopVPN: closing stopChan")
+			close(stopChan)
+			stopChan = nil
+		}
 
-	if tunDevice != nil {
-		tunDevice.Close()
-		tunDevice = nil
-	}
+		// 2. Ждем завершения TUN reader с таймаутом
+		if tunReaderDone != nil {
+			log.Println("StopVPN: waiting for TUN reader to finish...")
+			select {
+			case <-tunReaderDone:
+				log.Println("StopVPN: TUN reader finished")
+			case <-time.After(3 * time.Second):
+				log.Println("StopVPN: TUN reader timeout")
+			}
+			tunReaderDone = nil
+		}
 
-	isRunning = false
+		// 3. Останавливаем клиент
+		if clientInstance != nil {
+			log.Println("StopVPN: stopping client...")
+			clientInstance.Stop()
+			clientInstance = nil
+		}
+
+		// 4. Закрываем TUN устройство
+		if tunDevice != nil {
+			log.Println("StopVPN: closing TUN device...")
+			tunDevice.Close()
+			tunDevice = nil
+		}
+
+		isRunning = false
+		log.Println("StopVPN: VPN stopped successfully")
+	})
 
 	return C.CString(`{"status":"disconnected"}`)
 }
@@ -267,28 +318,80 @@ func GetStats() *C.char {
 
 	if !isRunning || clientInstance == nil {
 		status := VPNStatus{
-			Status: "disconnected",
+			Status:      "disconnected",
+			ClientIP:    "",
+			ServerIP:    "",
+			Ping:        0,
+			SpeedIn:     0,
+			SpeedOut:    0,
+			BytesIn:     0,
+			BytesOut:    0,
+			Mode:        "",
+			ConnectedAt: "",
 		}
 		jsonData, _ := json.Marshal(status)
 		return C.CString(string(jsonData))
 	}
 
 	stats := clientInstance.GetStats()
+	lastStats = stats
 
 	status := VPNStatus{
 		Status:   "connected",
 		ClientIP: "10.0.0.2",
 		ServerIP: currentServerIP,
+		Ping:     0,
+		SpeedIn:  0,
+		SpeedOut: 0,
+		BytesIn:  0,
+		BytesOut: 0,
+		Mode:     "",
 	}
 
-	if bytesIn, ok := stats["bytes_recv"].(uint64); ok {
-		status.BytesIn = int64(bytesIn)
+	if pingVal, ok := stats["ping_ms"]; ok {
+		if pingFloat, ok := pingVal.(float64); ok {
+			status.Ping = int(pingFloat)
+		}
 	}
-	if bytesOut, ok := stats["bytes_sent"].(uint64); ok {
-		status.BytesOut = int64(bytesOut)
+
+	if speedInVal, ok := stats["speed_in_mbps"]; ok {
+		if speedInFloat, ok := speedInVal.(float64); ok {
+			status.SpeedIn = int(speedInFloat)
+		}
 	}
-	if mode, ok := stats["current_mode"].(string); ok {
-		status.Mode = mode
+
+	if speedOutVal, ok := stats["speed_out_mbps"]; ok {
+		if speedOutFloat, ok := speedOutVal.(float64); ok {
+			status.SpeedOut = int(speedOutFloat)
+		}
+	}
+
+	if bytesInVal, ok := stats["bytes_recv"]; ok {
+		switch v := bytesInVal.(type) {
+		case uint64:
+			status.BytesIn = int64(v)
+		case int64:
+			status.BytesIn = v
+		case float64:
+			status.BytesIn = int64(v)
+		}
+	}
+
+	if bytesOutVal, ok := stats["bytes_sent"]; ok {
+		switch v := bytesOutVal.(type) {
+		case uint64:
+			status.BytesOut = int64(v)
+		case int64:
+			status.BytesOut = v
+		case float64:
+			status.BytesOut = int64(v)
+		}
+	}
+
+	if modeVal, ok := stats["current_mode"]; ok {
+		if modeStr, ok := modeVal.(string); ok {
+			status.Mode = modeStr
+		}
 	}
 
 	jsonData, _ := json.Marshal(status)
