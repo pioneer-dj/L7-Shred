@@ -349,14 +349,12 @@ func (m *MaskMixer) Unwrap(data []byte) ([]byte, error) {
 	m.lock()
 	defer m.unlock()
 
-	// Пробуем текущую маску
 	result, err := m.currentMask.Unwrap(data)
 	if err == nil {
 		m.packetsUnwrapped++
 		return result, nil
 	}
 
-	// Перебираем все маски
 	for _, mode := range m.modes {
 		testMask := m.factory.CreateMask(mode)
 		result, err := testMask.Unwrap(data)

@@ -50,6 +50,7 @@ type Client struct {
 	tunIndex         int
 	serverIP         string
 	serverPort       string
+	stopOnce         sync.Once
 }
 
 type ClientConfig struct {
@@ -181,6 +182,7 @@ func NewClient(config *ClientConfig) *Client {
 		tunInterface:  config.TUNInterface,
 		serverIP:      serverIP,
 		serverPort:    serverPort,
+		stopOnce:      sync.Once{},
 	}
 
 	if config.BackgroundEnabled {
@@ -490,47 +492,76 @@ func (c *Client) reconnect() error {
 
 func (c *Client) readLoop() {
 	defer c.wg.Done()
+	log.Println("[Client] readLoop started")
 
 	buf := make([]byte, 65536)
 
 	for {
 		select {
 		case <-c.stopChan:
+			log.Println("[Client] readLoop: stop signal received, exiting")
 			return
 		default:
 		}
 
 		conn := c.getConn()
 		if conn == nil {
-			time.Sleep(1 * time.Second)
+			select {
+			case <-c.stopChan:
+				log.Println("[Client] readLoop: stop signal received (conn nil), exiting")
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
+
+		readDone := make(chan struct{})
+		var n int
+		var err error
+
+		go func() {
+			n, err = conn.Read(buf)
+			close(readDone)
+		}()
+
+		select {
+		case <-c.stopChan:
+			log.Println("[Client] readLoop: stop signal during read, exiting")
+			return
+		case <-readDone:
+			if err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "use of closed") {
+					log.Printf("[Client] readLoop: connection closed: %v", err)
+					return
+				}
+				if strings.Contains(err.Error(), "timeout") {
+					continue
+				}
+				log.Printf("[Client] Read error: %v", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			if n == 0 {
+				continue
+			}
+
+			data := make([]byte, n)
+			copy(data, buf[:n])
+
+			if !c.handshakeDone {
+				continue
+			}
+
+			c.mu.Lock()
+			c.packetsRecv++
+			c.bytesRecv += uint64(n)
+			c.mu.Unlock()
+
+			go c.processIncomingPacket(data)
+		case <-time.After(500 * time.Millisecond):
 			continue
 		}
-
-		if err := conn.SetReadDeadline(time.Time{}); err != nil {
-			log.Printf("[Client] Failed to set read deadline: %v", err)
-		}
-
-		n, err := conn.Read(buf)
-		if err != nil {
-			log.Printf("[Client] Read error: %v, reconnecting...", err)
-			go c.reconnect()
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		data := make([]byte, n)
-		copy(data, buf[:n])
-
-		if !c.handshakeDone {
-			continue
-		}
-
-		c.mu.Lock()
-		c.packetsRecv++
-		c.bytesRecv += uint64(n)
-		c.mu.Unlock()
-
-		go c.processIncomingPacket(data)
 	}
 }
 
@@ -700,35 +731,53 @@ func (c *Client) removeRoutes() {
 }
 
 func (c *Client) Stop() error {
+	log.Println("[Client] Stop() called")
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.connected {
+		log.Println("[Client] Stop() - already stopped")
 		return nil
 	}
 
-	log.Printf("[Client] Stopping client...")
+	var stopErr error
 
-	if c.background != nil {
-		c.background.Stop()
-	}
+	c.stopOnce.Do(func() {
+		log.Println("[Client] Stop() - starting...")
 
-	c.removeRoutes()
+		if c.background != nil {
+			log.Println("[Client] Stop() - stopping background...")
+			c.background.Stop()
+			log.Println("[Client] Stop() - background stopped")
+		}
 
-	close(c.stopChan)
-	c.wg.Wait()
+		log.Println("[Client] Stop() - closing stopChan...")
+		close(c.stopChan)
+		log.Println("[Client] Stop() - stopChan closed")
 
-	if c.outbound != nil {
-		c.outbound.Close()
-	}
+		log.Println("[Client] Stop() - waiting for readLoop...")
+		c.wg.Wait()
+		log.Println("[Client] Stop() - readLoop finished")
 
-	c.connected = false
-	c.handshakeDone = false
+		if c.outbound != nil {
+			log.Println("[Client] Stop() - closing outbound...")
+			c.outbound.Close()
+			log.Println("[Client] Stop() - outbound closed")
+		}
 
-	log.Printf("[Client] Stopped. Stats: sent=%d packets (%d bytes), recv=%d packets (%d bytes)",
-		c.packetsSent, c.bytesSent, c.packetsRecv, c.bytesRecv)
+		log.Println("[Client] Stop() - removing routes...")
+		c.removeRoutes()
+		log.Println("[Client] Stop() - routes removed")
 
-	return nil
+		c.connected = false
+		c.handshakeDone = false
+
+		log.Printf("[Client] Stop() - stopped. Stats: sent=%d packets (%d bytes), recv=%d packets (%d bytes)",
+			c.packetsSent, c.bytesSent, c.packetsRecv, c.bytesRecv)
+	})
+
+	return stopErr
 }
 
 func (c *Client) ForceRotate() {

@@ -25,7 +25,6 @@ func NewTunDevice() (*TunDevice, error) {
 	}
 	log.Printf("TUN device created: %s", name)
 
-	// Устанавливаем MTU
 	cmd := exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
 		name, "mtu=1350", "store=active")
 	cmd.Run()

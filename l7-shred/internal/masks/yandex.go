@@ -16,59 +16,37 @@ func NewYandexMask() *YandexMask {
 	m := &YandexMask{
 		sequence: 0,
 	}
-
 	rand.Read(m.requestID[:])
 	rand.Read(m.magicBytes[:])
-
 	return m
 }
 
 func (y *YandexMask) Wrap(payload []byte) []byte {
-	headerLen := 32 + 4 // +4 для sequence
+	y.sequence++
+
+	headerLen := 38
 	header := make([]byte, headerLen)
 
 	copy(header[0:8], y.magicBytes[:])
-	header[8] = 0x01 // version major
-	header[9] = 0x00 // version minor
-
+	header[8] = 0x01
+	header[9] = 0x00
 	binary.BigEndian.PutUint32(header[10:14], y.sequence)
-	y.sequence++
-
 	timestamp := uint64(time.Now().Unix())
 	binary.BigEndian.PutUint64(header[14:22], timestamp)
-
 	copy(header[22:38], y.requestID[:])
 
-	paddingLen := 0
-	paddingByte := make([]byte, 1)
-	rand.Read(paddingByte)
-	paddingLen = int(paddingByte[0] % 16)
+	result := make([]byte, headerLen+len(payload))
+	copy(result, header)
+	copy(result[headerLen:], payload)
 
-	if paddingLen > 0 {
-		padding := make([]byte, paddingLen)
-		rand.Read(padding)
-		header = append(header, padding...)
-	}
-
-	return append(header, payload...)
+	return result
 }
 
 func (y *YandexMask) Unwrap(data []byte) ([]byte, error) {
-	minLen := 38
-	if len(data) < minLen {
+	if len(data) < 38 {
 		return nil, ErrInvalidPacket
 	}
-
-	if data[8] != 0x01 {
-	}
-
-	headerLen := 38
-
-	if len(data) < headerLen {
-		return nil, ErrInvalidPacket
-	}
-
-	return data[headerLen:], nil
+	return data[38:], nil
 }
 
 func (y *YandexMask) ID() string { return "yandex" }

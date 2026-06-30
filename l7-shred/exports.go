@@ -27,7 +27,6 @@ var (
 	stopChan        chan struct{}
 	currentServerIP string
 	lastStats       map[string]interface{}
-	stopOnce        sync.Once
 	tunReaderDone   chan struct{}
 )
 
@@ -121,7 +120,6 @@ func StartVPN(configJSON *C.char) *C.char {
 		}
 	}
 
-	// Добавляем текущую директорию в PATH для wintun.dll
 	exePath, err := os.Executable()
 	if err == nil {
 		exeDir := filepath.Dir(exePath)
@@ -217,7 +215,6 @@ func StartVPN(configJSON *C.char) *C.char {
 	stopChan = make(chan struct{})
 	tunReaderDone = make(chan struct{})
 
-	// TUN reader goroutine
 	go func() {
 		defer close(tunReaderDone)
 		log.Println("TUN reader: started")
@@ -250,7 +247,6 @@ func StartVPN(configJSON *C.char) *C.char {
 
 	clientInstance = client
 	isRunning = true
-	stopOnce = sync.Once{}
 
 	return C.CString(`{"status":"connected"}`)
 }
@@ -267,46 +263,39 @@ func StopVPN() *C.char {
 		return C.CString(`{"status":"disconnected"}`)
 	}
 
-	// Используем sync.Once для предотвращения повторного закрытия
-	stopOnce.Do(func() {
-		log.Println("StopVPN: stopping VPN...")
+	log.Println("StopVPN: stopping VPN...")
 
-		// 1. Сигналим TUN reader горутине о остановке
-		if stopChan != nil {
-			log.Println("StopVPN: closing stopChan")
-			close(stopChan)
-			stopChan = nil
-		}
+	// 1. Закрываем канал - сигнал горутине
+	if stopChan != nil {
+		log.Println("StopVPN: closing stopChan")
+		close(stopChan)
+		stopChan = nil
+	}
 
-		// 2. Ждем завершения TUN reader с таймаутом
-		if tunReaderDone != nil {
-			log.Println("StopVPN: waiting for TUN reader to finish...")
-			select {
-			case <-tunReaderDone:
-				log.Println("StopVPN: TUN reader finished")
-			case <-time.After(3 * time.Second):
-				log.Println("StopVPN: TUN reader timeout")
-			}
-			tunReaderDone = nil
-		}
+	// 2. Закрываем TUN - разблокирует Read()
+	if tunDevice != nil {
+		log.Println("StopVPN: closing TUN device...")
+		tunDevice.Close()
+		tunDevice = nil
+	}
 
-		// 3. Останавливаем клиент
-		if clientInstance != nil {
-			log.Println("StopVPN: stopping client...")
-			clientInstance.Stop()
-			clientInstance = nil
-		}
+	// 3. Ждем завершения горутины (читаем из канала)
+	if tunReaderDone != nil {
+		log.Println("StopVPN: waiting for TUN reader...")
+		<-tunReaderDone
+		log.Println("StopVPN: TUN reader finished")
+		tunReaderDone = nil
+	}
 
-		// 4. Закрываем TUN устройство
-		if tunDevice != nil {
-			log.Println("StopVPN: closing TUN device...")
-			tunDevice.Close()
-			tunDevice = nil
-		}
+	// 4. Останавливаем клиент
+	if clientInstance != nil {
+		log.Println("StopVPN: stopping client...")
+		clientInstance.Stop()
+		clientInstance = nil
+	}
 
-		isRunning = false
-		log.Println("StopVPN: VPN stopped successfully")
-	})
+	isRunning = false
+	log.Println("StopVPN: VPN stopped successfully")
 
 	return C.CString(`{"status":"disconnected"}`)
 }

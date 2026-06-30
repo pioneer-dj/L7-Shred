@@ -4,6 +4,7 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -24,7 +25,7 @@ func NewTunDevice() (*TunDevice, error) {
 		_     [22]byte
 	}{}
 	copy(ifr.name[:], "tun0")
-	ifr.flags = 0x0001 | 0x1000 // IFF_TUN | IFF_NO_PI
+	ifr.flags = 0x0001 | 0x1000
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x400454ca, uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
@@ -34,11 +35,31 @@ func NewTunDevice() (*TunDevice, error) {
 
 	name := strings.TrimRight(string(ifr.name[:]), "\x00")
 
-	// Поднимаем интерфейс
 	exec.Command("ip", "addr", "add", "10.0.0.1/24", "dev", name).Run()
 	exec.Command("ip", "link", "set", "dev", name, "up").Run()
 
 	return &TunDevice{fd: fd, name: name}, nil
+}
+
+// ReadWithTimeout читает из TUN с таймаутом
+func (t *TunDevice) ReadWithTimeout(timeout time.Duration) ([]byte, error) {
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+
+	go func() {
+		data, err := t.Read()
+		done <- result{data, err}
+	}()
+
+	select {
+	case res := <-done:
+		return res.data, res.err
+	case <-time.After(timeout):
+		return nil, nil
+	}
 }
 
 func (t *TunDevice) Read() ([]byte, error) {
@@ -61,4 +82,9 @@ func (t *TunDevice) Close() error {
 
 func (t *TunDevice) Name() string {
 	return t.name
+}
+
+func (t *TunDevice) SetupIP(ip string) error {
+	// Linux уже настроен в NewTunDevice
+	return nil
 }
