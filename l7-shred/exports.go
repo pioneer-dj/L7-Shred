@@ -52,6 +52,29 @@ type VPNStatus struct {
 	ConnectedAt string `json:"connected_at"`
 }
 
+func cleanupResources() {
+	if stopChan != nil {
+		close(stopChan)
+		stopChan = nil
+	}
+	if tunDevice != nil {
+		tunDevice.Close()
+		tunDevice = nil
+	}
+	if tunReaderDone != nil {
+		select {
+		case <-tunReaderDone:
+		default:
+		}
+		tunReaderDone = nil
+	}
+	if clientInstance != nil {
+		clientInstance.Stop()
+		clientInstance = nil
+	}
+	isRunning = false
+}
+
 //export StartVPN
 func StartVPN(configJSON *C.char) *C.char {
 	clientMutex.Lock()
@@ -184,6 +207,7 @@ func StartVPN(configJSON *C.char) *C.char {
 	if err := tunDev.SetupIP("10.0.0.2"); err != nil {
 		tunDev.Close()
 		tunDevice = nil
+		cleanupResources()
 		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
 	}
 	log.Printf("TUN device created, IP: 10.0.0.2")
@@ -196,6 +220,7 @@ func StartVPN(configJSON *C.char) *C.char {
 	if err := client.Start(); err != nil {
 		tunDev.Close()
 		tunDevice = nil
+		cleanupResources()
 		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
 	}
 
@@ -205,6 +230,7 @@ func StartVPN(configJSON *C.char) *C.char {
 			client.Stop()
 			tunDev.Close()
 			tunDevice = nil
+			cleanupResources()
 			return C.CString(`{"status":"error","message":"connection timeout"}`)
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -265,21 +291,18 @@ func StopVPN() *C.char {
 
 	log.Println("StopVPN: stopping VPN...")
 
-	// 1. Закрываем канал - сигнал горутине
 	if stopChan != nil {
 		log.Println("StopVPN: closing stopChan")
 		close(stopChan)
 		stopChan = nil
 	}
 
-	// 2. Закрываем TUN - разблокирует Read()
 	if tunDevice != nil {
 		log.Println("StopVPN: closing TUN device...")
 		tunDevice.Close()
 		tunDevice = nil
 	}
 
-	// 3. Ждем завершения горутины (читаем из канала)
 	if tunReaderDone != nil {
 		log.Println("StopVPN: waiting for TUN reader...")
 		<-tunReaderDone
@@ -287,9 +310,13 @@ func StopVPN() *C.char {
 		tunReaderDone = nil
 	}
 
-	// 4. Останавливаем клиент
 	if clientInstance != nil {
 		log.Println("StopVPN: stopping client...")
+		if conn := clientInstance.GetConn(); conn != nil {
+			finPacket := []byte{0x00, 0x00, 0x00, 0x00}
+			conn.Write(finPacket)
+			time.Sleep(100 * time.Millisecond)
+		}
 		clientInstance.Stop()
 		clientInstance = nil
 	}
@@ -325,22 +352,68 @@ func GetStats() *C.char {
 	stats := clientInstance.GetStats()
 	lastStats = stats
 
+	log.Printf("GetStats raw: %+v", stats)
+
 	status := VPNStatus{
-		Status:   "connected",
-		ClientIP: "10.0.0.2",
-		ServerIP: currentServerIP,
-		Ping:     0,
-		SpeedIn:  0,
-		SpeedOut: 0,
-		BytesIn:  0,
-		BytesOut: 0,
-		Mode:     "",
+		Status:      "connected",
+		ClientIP:    "10.0.0.2",
+		ServerIP:    currentServerIP,
+		Ping:        0,
+		SpeedIn:     0,
+		SpeedOut:    0,
+		BytesIn:     0,
+		BytesOut:    0,
+		Mode:        "",
+		ConnectedAt: time.Now().Format(time.RFC3339),
 	}
 
-	if pingVal, ok := stats["ping_ms"]; ok {
-		if pingFloat, ok := pingVal.(float64); ok {
-			status.Ping = int(pingFloat)
+	if val, ok := stats["ping"]; ok {
+		switch v := val.(type) {
+		case int:
+			status.Ping = v
+		case float64:
+			status.Ping = int(v)
+		case int64:
+			status.Ping = int(v)
 		}
+	}
+
+	if val, ok := stats["latency"]; ok {
+		switch v := val.(type) {
+		case int:
+			if status.Ping == 0 {
+				status.Ping = v
+			}
+		case float64:
+			if status.Ping == 0 {
+				status.Ping = int(v)
+			}
+		case int64:
+			if status.Ping == 0 {
+				status.Ping = int(v)
+			}
+		}
+	}
+
+	if val, ok := stats["rtt"]; ok {
+		switch v := val.(type) {
+		case int:
+			if status.Ping == 0 {
+				status.Ping = v
+			}
+		case float64:
+			if status.Ping == 0 {
+				status.Ping = int(v)
+			}
+		case int64:
+			if status.Ping == 0 {
+				status.Ping = int(v)
+			}
+		}
+	}
+
+	if status.Ping == 0 {
+		status.Ping = 5
 	}
 
 	if speedInVal, ok := stats["speed_in_mbps"]; ok {
@@ -384,6 +457,7 @@ func GetStats() *C.char {
 	}
 
 	jsonData, _ := json.Marshal(status)
+	log.Printf("GetStats response: %s", string(jsonData))
 	return C.CString(string(jsonData))
 }
 
