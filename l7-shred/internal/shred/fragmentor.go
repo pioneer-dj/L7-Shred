@@ -1,6 +1,47 @@
 package shred
 
-import "time"
+import (
+	"sync"
+	"time"
+)
+
+const maxPooledBufferSize = 2048
+
+var BytePool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, maxPooledBufferSize)
+		return &buf
+	},
+}
+
+type PooledBuffer struct {
+	buf     []byte
+	length  int
+	pool    *sync.Pool
+	ownedBy bool
+}
+
+func (pb *PooledBuffer) Bytes() []byte {
+	if pb == nil {
+		return nil
+	}
+	return pb.buf[:pb.length]
+}
+
+func (pb *PooledBuffer) Release() {
+	if pb == nil {
+		return
+	}
+	pb.length = 0
+	if pb.pool != nil && pb.buf != nil {
+		pb.pool.Put(&pb.buf)
+	}
+}
+
+func GetPooledBuffer() *PooledBuffer {
+	bufPtr := BytePool.Get().(*[]byte)
+	return &PooledBuffer{buf: *bufPtr, pool: &BytePool, ownedBy: true}
+}
 
 type Fragmentor struct {
 	minSize      int
@@ -17,25 +58,26 @@ func NewFragmentor(minSize, maxSize int) *Fragmentor {
 	}
 }
 
-func (f *Fragmentor) Fragment(data []byte) [][]byte {
+func (f *Fragmentor) Fragment(data []byte, emit func(*PooledBuffer)) {
+	f.FragmentWithCallback(data, emit)
+}
+
+func (f *Fragmentor) FragmentWithCallback(data []byte, emit func(*PooledBuffer)) {
 	f.rotateIfNeeded()
 
-	var fragments [][]byte
 	remaining := data
-
 	for len(remaining) > 0 {
 		size := f.currentSize
 		if size > len(remaining) {
 			size = len(remaining)
 		}
 
-		fragment := make([]byte, size)
-		copy(fragment, remaining[:size])
-		fragments = append(fragments, fragment)
+		buffer := GetPooledBuffer()
+		copy(buffer.buf[:size], remaining[:size])
+		buffer.length = size
+		emit(buffer)
 		remaining = remaining[size:]
 	}
-
-	return fragments
 }
 
 func (f *Fragmentor) rotateIfNeeded() {

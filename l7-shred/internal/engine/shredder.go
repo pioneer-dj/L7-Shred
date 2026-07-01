@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/l7-shred/core/internal/crypto"
+	"github.com/l7-shred/core/internal/proto"
 	"github.com/l7-shred/core/internal/shred"
 )
 
@@ -52,7 +53,7 @@ func (f *Fragmentor) rotateIfNeeded() {
 }
 
 type Shredder struct {
-	fragmentor *Fragmentor
+	fragmentor *proto.Fragmentor
 	jitter     *shred.TemporalJitter
 	shaper     *shred.TrafficShaper
 	cipher     *crypto.AEADCipher
@@ -61,7 +62,7 @@ type Shredder struct {
 
 func NewShredder(sessionID uint64, cipher *crypto.AEADCipher) *Shredder {
 	return &Shredder{
-		fragmentor: NewFragmentor(32, 288),
+		fragmentor: proto.NewFragmentor(32, 288),
 		jitter:     shred.NewTemporalJitter(2*time.Millisecond, 1*time.Millisecond, 0.005),
 		shaper:     shred.NewTrafficShaper(500, 1500, 10*time.Millisecond),
 		cipher:     cipher,
@@ -78,23 +79,41 @@ func (s *Shredder) Shred(reader io.Reader, writer io.Writer) error {
 			return err
 		}
 
-		bursts := s.shaper.Process(buf[:n])
+		var processErr error
+		s.shaper.Process(buf[:n], func(burst *shred.PooledBuffer) {
+			if processErr != nil {
+				burst.Release()
+				return
+			}
 
-		for _, burst := range bursts {
-			fragments := s.fragmentor.Fragment(burst)
+			s.fragmentor.FragmentWithCallback(burst.Bytes(), func(fragment *proto.PoolBuffer) {
+				if processErr != nil {
+					fragment.Release()
+					return
+				}
 
-			for _, fragment := range fragments {
-				encrypted, err := s.cipher.Encrypt(fragment)
+				encrypted, err := s.cipher.Encrypt(fragment.Buf[:fragment.Len])
 				if err != nil {
-					return err
+					processErr = err
+					fragment.Release()
+					return
 				}
 
 				if _, err := writer.Write(encrypted); err != nil {
-					return err
+					processErr = err
+					fragment.Release()
+					return
 				}
 
 				s.jitter.Apply()
-			}
+				fragment.Release()
+			})
+
+			burst.Release()
+		})
+
+		if processErr != nil {
+			return processErr
 		}
 	}
 }

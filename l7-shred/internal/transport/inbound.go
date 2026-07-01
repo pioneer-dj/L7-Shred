@@ -5,30 +5,31 @@ import (
 	"log"
 	"net"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/l7-shred/core/internal/crypto"
+	"github.com/l7-shred/core/internal/proto"
 	"github.com/l7-shred/core/internal/shred"
-	"github.com/xtaci/kcp-go/v5"
 )
 
-type Inbound struct {
-	config      *Config
-	listener    net.Listener
-	packetConn  net.PacketConn
-	sessionMgr  *shred.SessionManager
-	cipher      *crypto.AEADCipher
-	udpConns    map[string]*UDPConnWrapper
-	udpMu       sync.RWMutex
-	kcpListener *kcp.Listener
+type udpPacket struct {
+	data []byte
+	addr *net.UDPAddr
 }
 
-type UDPConnWrapper struct {
-	conn       net.PacketConn
-	remoteAddr net.Addr
-	readChan   chan []byte
-	closed     bool
-	mu         sync.RWMutex
+type Inbound struct {
+	config     *Config
+	listener   net.Listener
+	udpConn    *net.UDPConn
+	sessionMgr *shred.SessionManager
+	cipher     *crypto.AEADCipher
+	mixer      *shred.MaskMixer
+	arq        *proto.ARQManager
+	packetCh   chan udpPacket
+	dataCh     chan []byte
+	closeCh    chan struct{}
+	wg         sync.WaitGroup
+	dropCount  uint64
 }
 
 func NewInbound(config *Config) (*Inbound, error) {
@@ -42,50 +43,19 @@ func NewInbound(config *Config) (*Inbound, error) {
 		config:     config,
 		sessionMgr: shred.NewSessionManager(),
 		cipher:     cipher,
-		udpConns:   make(map[string]*UDPConnWrapper),
+		mixer:      shred.NewMaskMixer(5 * 60 * 1000000000),
+		arq:        proto.NewARQManager(),
+		packetCh:   make(chan udpPacket, 10000),
+		dataCh:     make(chan []byte, 10000),
+		closeCh:    make(chan struct{}),
 	}, nil
 }
 
 func (i *Inbound) Start() error {
-	if i.config.ReliableUDP {
-		return i.startReliableUDP()
-	}
 	if i.config.Mode == "udp" {
 		return i.startUDP()
 	}
 	return i.startTCP()
-}
-
-func (i *Inbound) startReliableUDP() error {
-	listener, err := kcp.ListenWithOptions(i.config.ListenAddr, nil, 10, 3)
-	if err != nil {
-		return err
-	}
-	i.kcpListener = listener
-	log.Printf("[KCP] Server listening on %s with KCP", i.config.ListenAddr)
-	go i.kcpAcceptLoop()
-	return nil
-}
-
-func (i *Inbound) kcpAcceptLoop() {
-	for {
-		kcpConn, err := i.kcpListener.AcceptKCP()
-		if err != nil {
-			log.Printf("[KCP] Accept error: %v", err)
-			return
-		}
-
-		kcpConn.SetStreamMode(false)
-		kcpConn.SetWindowSize(4096, 4096)
-		kcpConn.SetNoDelay(1, 10, 2, 1)
-		kcpConn.SetMtu(1400)
-		kcpConn.SetReadBuffer(16777216)
-		kcpConn.SetWriteBuffer(16777216)
-		kcpConn.SetACKNoDelay(true)
-
-		log.Printf("[KCP] New KCP connection from %s", kcpConn.RemoteAddr())
-		go i.handleConnection(kcpConn)
-	}
 }
 
 func (i *Inbound) startTCP() error {
@@ -100,14 +70,107 @@ func (i *Inbound) startTCP() error {
 }
 
 func (i *Inbound) startUDP() error {
-	packetConn, err := net.ListenPacket("udp", i.config.ListenAddr)
+	addr, err := net.ResolveUDPAddr("udp", i.config.ListenAddr)
 	if err != nil {
 		return err
 	}
-	i.packetConn = packetConn
-	log.Printf("[UDP] Server listening on %s (raw UDP)", i.config.ListenAddr)
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return err
+	}
+	i.udpConn = conn
+	log.Printf("[UDP] Server listening on %s (ARQ enabled)", i.config.ListenAddr)
+
+	go i.recvLoop()
 	go i.packetLoop()
 	return nil
+}
+
+func (i *Inbound) recvLoop() {
+	buf := make([]byte, 65536)
+
+	for {
+		select {
+		case <-i.closeCh:
+			return
+		default:
+		}
+
+		n, addr, err := i.udpConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+
+		dataCopy := make([]byte, n)
+		copy(dataCopy, buf[:n])
+
+		select {
+		case i.packetCh <- udpPacket{data: dataCopy, addr: addr}:
+		default:
+			atomic.AddUint64(&i.dropCount, 1)
+		}
+	}
+}
+
+func (i *Inbound) packetLoop() {
+	for {
+		select {
+		case <-i.closeCh:
+			return
+		case pkt := <-i.packetCh:
+			i.handleUDPPacket(pkt.data, pkt.addr)
+		}
+	}
+}
+
+func (i *Inbound) handleUDPPacket(data []byte, addr *net.UDPAddr) {
+	unwrapped, err := i.mixer.Unwrap(data)
+	if err != nil {
+		return
+	}
+
+	frame, err := proto.DecodeFrame(unwrapped)
+	if err != nil {
+		return
+	}
+
+	if frame.Flags == proto.FrameFlagAck {
+		if i.arq != nil {
+			i.arq.MarkAcked(frame.Ack)
+		}
+		return
+	}
+
+	if frame.Flags == proto.FrameFlagData {
+		if i.arq != nil {
+			ackFrame := &proto.Frame{
+				Flags:  proto.FrameFlagAck,
+				Seq:    0,
+				Ack:    frame.Seq,
+				MaskID: frame.MaskID,
+			}
+			ackData := ackFrame.Encode()
+			ackMasked := i.mixer.Wrap(ackData)
+			i.udpConn.WriteToUDP(ackMasked, addr)
+		}
+
+		decrypted, err := i.cipher.Decrypt(frame.Payload)
+		if err != nil {
+			return
+		}
+
+		session := i.sessionMgr.CreateSession()
+		session.BytesIn += uint64(len(decrypted))
+
+		if len(decrypted) > 0 {
+			select {
+			case i.dataCh <- decrypted:
+			default:
+				atomic.AddUint64(&i.dropCount, 1)
+			}
+		}
+	}
 }
 
 func (i *Inbound) acceptLoop() {
@@ -135,10 +198,6 @@ func (i *Inbound) handleConnection(conn net.Conn) {
 			return
 		}
 
-		if n == 1 && buf[0] == 0 {
-			continue
-		}
-
 		decrypted, err := i.cipher.Decrypt(buf[:n])
 		if err != nil {
 			continue
@@ -156,172 +215,24 @@ func (i *Inbound) handleConnection(conn net.Conn) {
 	}
 }
 
-func (i *Inbound) packetLoop() {
-	buf := make([]byte, 65536)
-	for {
-		n, addr, err := i.packetConn.ReadFrom(buf)
-		if err != nil {
-			return
-		}
-		go i.handlePacket(buf[:n], addr)
-	}
-}
-
-func (i *Inbound) handlePacket(data []byte, addr net.Addr) {
-	addrStr := addr.String()
-
-	i.udpMu.RLock()
-	wrapper, exists := i.udpConns[addrStr]
-	i.udpMu.RUnlock()
-
-	if !exists {
-		log.Printf("[UDP] New connection from %s", addrStr)
-		wrapper = &UDPConnWrapper{
-			conn:       i.packetConn,
-			remoteAddr: addr,
-			readChan:   make(chan []byte, 5000),
-		}
-		i.udpMu.Lock()
-		i.udpConns[addrStr] = wrapper
-		i.udpMu.Unlock()
-	}
-
-	select {
-	case wrapper.readChan <- data:
-	default:
-	}
-}
-
 func (i *Inbound) Accept() (net.Conn, error) {
-	if i.kcpListener != nil {
-		return i.kcpListener.AcceptKCP()
-	}
 	if i.listener != nil {
 		return i.listener.Accept()
-	}
-	if i.packetConn != nil {
-		return i.acceptUDP()
 	}
 	return nil, net.ErrClosed
 }
 
-func (i *Inbound) acceptUDP() (net.Conn, error) {
-	for {
-		i.udpMu.RLock()
-		for addrStr, wrapper := range i.udpConns {
-			select {
-			case data := <-wrapper.readChan:
-				i.udpMu.RUnlock()
-				return &UDPConn{
-					wrapper:    wrapper,
-					remoteAddr: wrapper.remoteAddr,
-					localAddr:  i.packetConn.LocalAddr(),
-					readData:   data,
-				}, nil
-			default:
-			}
-			_ = addrStr
-		}
-		i.udpMu.RUnlock()
-
-		time.Sleep(10 * time.Millisecond)
-	}
+func (i *Inbound) DataChan() <-chan []byte {
+	return i.dataCh
 }
 
 func (i *Inbound) Stop() error {
-	if i.kcpListener != nil {
-		i.kcpListener.Close()
-	}
+	close(i.closeCh)
 	if i.listener != nil {
 		i.listener.Close()
 	}
-	if i.packetConn != nil {
-		i.packetConn.Close()
+	if i.udpConn != nil {
+		i.udpConn.Close()
 	}
-
-	i.udpMu.Lock()
-	for _, wrapper := range i.udpConns {
-		wrapper.mu.Lock()
-		wrapper.closed = true
-		close(wrapper.readChan)
-		wrapper.mu.Unlock()
-	}
-	i.udpConns = make(map[string]*UDPConnWrapper)
-	i.udpMu.Unlock()
-
-	return nil
-}
-
-type UDPConn struct {
-	wrapper    *UDPConnWrapper
-	remoteAddr net.Addr
-	localAddr  net.Addr
-	readData   []byte
-	closed     bool
-	mu         sync.RWMutex
-}
-
-func (u *UDPConn) Read(b []byte) (int, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-
-	if u.closed {
-		return 0, net.ErrClosed
-	}
-
-	if u.readData != nil {
-		n := copy(b, u.readData)
-		u.readData = nil
-		return n, nil
-	}
-
-	select {
-	case data, ok := <-u.wrapper.readChan:
-		if !ok {
-			return 0, net.ErrClosed
-		}
-		n := copy(b, data)
-		if len(data) > n {
-			u.readData = data[n:]
-		}
-		return n, nil
-	}
-}
-
-func (u *UDPConn) Write(b []byte) (int, error) {
-	u.mu.RLock()
-	defer u.mu.RUnlock()
-
-	if u.closed {
-		return 0, net.ErrClosed
-	}
-
-	return u.wrapper.conn.WriteTo(b, u.remoteAddr)
-}
-
-func (u *UDPConn) Close() error {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.closed = true
-	return nil
-}
-
-func (u *UDPConn) LocalAddr() net.Addr {
-	return u.localAddr
-}
-
-func (u *UDPConn) RemoteAddr() net.Addr {
-	return u.remoteAddr
-}
-
-func (u *UDPConn) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func (u *UDPConn) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-func (u *UDPConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }

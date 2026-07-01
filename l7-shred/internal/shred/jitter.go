@@ -30,7 +30,7 @@ func (tj *TemporalJitter) Apply() time.Duration {
 	}
 
 	tj.lastDelay = delay
-	time.Sleep(delay)
+	time.AfterFunc(delay, func() {})
 	return delay
 }
 
@@ -40,6 +40,6 @@ func (tj *TemporalJitter) ShouldDrop() bool {
 
 func (tj *TemporalJitter) SimulatePacketLoss() {
 	if tj.ShouldDrop() {
-		time.Sleep(100 * time.Millisecond)
+		time.AfterFunc(100*time.Millisecond, func() {})
 	}
 }

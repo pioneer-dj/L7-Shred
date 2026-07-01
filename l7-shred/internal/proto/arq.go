@@ -1,101 +1,9 @@
-package engine
+package proto
 
 import (
-	"encoding/binary"
-	"errors"
-	"io"
-	"net"
 	"sync"
 	"time"
 )
-
-const maxFrameSize = 65535
-
-// FrameHeaderSize = Flags(1) + Seq(8) + Ack(8)
-const FrameHeaderSize = 1 + 8 + 8
-
-const (
-	FrameFlagData = 0x01
-	FrameFlagAck  = 0x02
-	FrameFlagPing = 0x03
-)
-
-type Frame struct {
-	Flags   byte
-	Seq     uint64
-	Ack     uint64
-	Payload []byte
-}
-
-func (f *Frame) Encode() []byte {
-	buf := make([]byte, FrameHeaderSize+len(f.Payload))
-	buf[0] = f.Flags
-	binary.BigEndian.PutUint64(buf[1:9], f.Seq)
-	binary.BigEndian.PutUint64(buf[9:17], f.Ack)
-	copy(buf[17:], f.Payload)
-	return buf
-}
-
-func DecodeFrame(data []byte) (*Frame, error) {
-	if len(data) < FrameHeaderSize {
-		return nil, errors.New("frame too short")
-	}
-	return &Frame{
-		Flags:   data[0],
-		Seq:     binary.BigEndian.Uint64(data[1:9]),
-		Ack:     binary.BigEndian.Uint64(data[9:17]),
-		Payload: data[17:],
-	}, nil
-}
-
-var errFrameTooLarge = errors.New("frame too large")
-
-func isStreamConn(c net.Conn) bool {
-	_, ok := c.(*net.TCPConn)
-	return ok
-}
-
-func writeFrame(c net.Conn, data []byte) error {
-	if isStreamConn(c) {
-		if len(data) > maxFrameSize {
-			return errFrameTooLarge
-		}
-		buf := make([]byte, 4+len(data))
-		binary.BigEndian.PutUint32(buf[:4], uint32(len(data)))
-		copy(buf[4:], data)
-		_, err := c.Write(buf)
-		return err
-	}
-	_, err := c.Write(data)
-	return err
-}
-
-func readFrame(c net.Conn, scratch []byte) ([]byte, error) {
-	if isStreamConn(c) {
-		var hdr [4]byte
-		if _, err := io.ReadFull(c, hdr[:]); err != nil {
-			return nil, err
-		}
-		length := binary.BigEndian.Uint32(hdr[:])
-		if length == 0 || length > maxFrameSize {
-			return nil, errFrameTooLarge
-		}
-		buf := make([]byte, length)
-		if _, err := io.ReadFull(c, buf); err != nil {
-			return nil, err
-		}
-		return buf, nil
-	}
-	n, err := c.Read(scratch)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, n)
-	copy(out, scratch[:n])
-	return out, nil
-}
-
-// ---------- ARQ Manager ----------
 
 type PacketEntry struct {
 	Data     []byte
@@ -150,10 +58,7 @@ func (a *ARQManager) GetPacket(seq uint64) ([]byte, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	entry, ok := a.sentPackets[seq]
-	if !ok {
-		return nil, false
-	}
-	return entry.Data, true
+	return entry.Data, ok
 }
 
 func (a *ARQManager) GetPendingForRetransmit() []uint64 {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/masks"
+	"github.com/l7-shred/core/internal/proto"
 )
 
 func TestWebRTCMasking(t *testing.T) {
@@ -53,7 +54,7 @@ func TestJitterSimulation(t *testing.T) {
 }
 
 func TestFragmentRotation(t *testing.T) {
-	fragmentor := engine.NewFragmentor(32, 288)
+	fragmentor := proto.NewFragmentor(32, 288)
 
 	size1 := fragmentor.currentSize
 	time.Sleep(31 * time.Second)

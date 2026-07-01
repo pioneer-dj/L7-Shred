@@ -25,8 +25,11 @@ func NewTrafficShaper(minBurst, maxBurst int, interBurst time.Duration) *Traffic
 	}
 }
 
-func (ts *TrafficShaper) Process(data []byte) [][]byte {
-	var bursts [][]byte
+func (ts *TrafficShaper) Process(data []byte, emit func(*PooledBuffer)) {
+	ts.ProcessWithCallback(data, emit)
+}
+
+func (ts *TrafficShaper) ProcessWithCallback(data []byte, emit func(*PooledBuffer)) {
 	remaining := data
 
 	for len(remaining) > 0 {
@@ -38,13 +41,12 @@ func (ts *TrafficShaper) Process(data []byte) [][]byte {
 			burstSize = len(remaining)
 		}
 
-		burst := make([]byte, burstSize)
-		copy(burst, remaining[:burstSize])
-		bursts = append(bursts, burst)
+		buffer := GetPooledBuffer()
+		copy(buffer.buf[:burstSize], remaining[:burstSize])
+		buffer.length = burstSize
+		emit(buffer)
 		remaining = remaining[burstSize:]
 	}
-
-	return bursts
 }
 
 func (ts *TrafficShaper) Start() {

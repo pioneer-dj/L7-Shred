@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/l7-shred/core/internal/proto"
 	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
 	"github.com/l7-shred/core/internal/tun"
@@ -107,7 +108,7 @@ func (s *Server) tunLoop() {
 		for _, sc := range s.connections {
 			wrapped := sc.Session.Wrap(data)
 			sc.writeMu.Lock()
-			err := writeFrame(sc.Conn, wrapped)
+			err := proto.WriteFrame(sc.Conn, wrapped)
 			sc.writeMu.Unlock()
 			if err != nil {
 				s.logger.Printf("Failed to write to client %d: %v", sc.ID, err)
@@ -194,7 +195,7 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 		default:
 		}
 
-		data, err := readFrame(sc.Conn, scratch)
+		data, err := proto.ReadFrame(sc.Conn, scratch)
 		if err != nil {
 			s.logger.Printf("Read error from session %d: %v", sc.ID, err)
 			return
@@ -249,7 +250,7 @@ func (s *Server) SendToSession(sessionID uint64, data []byte) error {
 	wrapped := sc.Session.Wrap(data)
 
 	sc.writeMu.Lock()
-	err := writeFrame(sc.Conn, wrapped)
+	err := proto.WriteFrame(sc.Conn, wrapped)
 	sc.writeMu.Unlock()
 
 	sc.mu.Lock()

@@ -4,24 +4,28 @@ import (
 	"log"
 	"net"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/l7-shred/core/internal/crypto"
+	"github.com/l7-shred/core/internal/proto"
 	"github.com/l7-shred/core/internal/shred"
-	"github.com/xtaci/kcp-go/v5"
 )
 
 type Outbound struct {
 	config     *Config
 	conn       net.Conn
-	packetConn net.Conn
-	remoteAddr net.Addr
+	udpConn    *net.UDPConn
+	remoteAddr *net.UDPAddr
 	session    *shred.Session
 	cipher     *crypto.AEADCipher
 	mu         sync.RWMutex
+	arq        *proto.ARQManager
 	writeCh    chan []byte
 	closeCh    chan struct{}
 	wg         sync.WaitGroup
+	fragmentor *proto.Fragmentor
+	mixer      *shred.MaskMixer
+	dropCount  uint64
 }
 
 func NewOutbound(config *Config) (*Outbound, error) {
@@ -35,18 +39,17 @@ func NewOutbound(config *Config) (*Outbound, error) {
 	session := sessionMgr.CreateSession()
 
 	return &Outbound{
-		config:  config,
-		session: session,
-		cipher:  cipher,
-		writeCh: make(chan []byte, 5000),
-		closeCh: make(chan struct{}),
+		config:     config,
+		session:    session,
+		cipher:     cipher,
+		writeCh:    make(chan []byte, 10000),
+		closeCh:    make(chan struct{}),
+		fragmentor: proto.NewFragmentor(32, 288),
+		mixer:      shred.NewMaskMixer(5 * 60 * 1000000000),
 	}, nil
 }
 
 func (o *Outbound) Connect() error {
-	if o.config.ReliableUDP {
-		return o.connectReliableUDP()
-	}
 	if o.config.Protocol == "udp" {
 		return o.connectUDP()
 	}
@@ -65,79 +68,30 @@ func (o *Outbound) connectTCP() error {
 func (o *Outbound) connectUDP() error {
 	log.Printf("[UDP] Connecting to %s", o.config.ServerAddr)
 
-	conn, err := net.Dial("udp", o.config.ServerAddr)
-	if err != nil {
-		return err
-	}
-	o.packetConn = conn
-
 	addr, err := net.ResolveUDPAddr("udp", o.config.ServerAddr)
 	if err != nil {
 		return err
 	}
+
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return err
+	}
+
+	o.udpConn = conn
 	o.remoteAddr = addr
 
-	log.Printf("[UDP] Connected to %s", o.config.ServerAddr)
+	o.arq = proto.NewARQManager()
+	o.arq.StartRetransmitLoop(func(data []byte) error {
+		_, err := o.udpConn.Write(data)
+		return err
+	})
+
+	o.wg.Add(1)
+	go o.writeLoop()
+
+	log.Printf("[UDP] Connected to %s (ARQ enabled)", o.config.ServerAddr)
 	return nil
-}
-
-func (o *Outbound) connectReliableUDP() error {
-    log.Printf("[ReliableUDP] Connecting to %s", o.config.ServerAddr)
-
-    windowSize := 1024
-    if o.config.WindowSize > 0 {
-        windowSize = o.config.WindowSize
-    }
-
-    readBuffer := 4194304
-    if o.config.ReadBuffer > 0 {
-        readBuffer = o.config.ReadBuffer
-    }
-
-    writeBuffer := 4194304
-    if o.config.WriteBuffer > 0 {
-        writeBuffer = o.config.WriteBuffer
-    }
-
-    kcpConn, err := kcp.DialWithOptions(o.config.ServerAddr, nil, 10, 3)
-    if err != nil {
-        return err
-    }
-
-    kcpConn.SetStreamMode(false)
-    kcpConn.SetWindowSize(windowSize, windowSize)
-    kcpConn.SetNoDelay(1, 10, 2, 1)
-    kcpConn.SetMtu(o.config.MTU)
-    kcpConn.SetReadBuffer(readBuffer)
-    kcpConn.SetWriteBuffer(writeBuffer)
-    kcpConn.SetACKNoDelay(true)
-
-    o.packetConn = kcpConn
-    o.remoteAddr = kcpConn.RemoteAddr()
-
-    o.wg.Add(1)
-    go o.writeLoop()
-
-    log.Printf("[ReliableUDP] Connected (window=%d, buffer=%d, mtu=%d)", 
-        windowSize, readBuffer, o.config.MTU)
-    return nil
-}
-
-func (o *Outbound) keepAliveLoop(conn net.Conn) {
-	defer o.wg.Done()
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-o.closeCh:
-			return
-		case <-ticker.C:
-			_, err := conn.Write([]byte{0})
-			if err != nil {
-				log.Printf("[KeepAlive] Write error: %v", err)
-			}
-		}
-	}
 }
 
 func (o *Outbound) writeLoop() {
@@ -148,26 +102,50 @@ func (o *Outbound) writeLoop() {
 		case <-o.closeCh:
 			return
 		case data := <-o.writeCh:
-			if o.packetConn == nil {
-				continue
-			}
-			_, err := o.packetConn.Write(data)
-			if err != nil {
-				log.Printf("[Outbound] Write error: %v", err)
-			}
+			o.sendWithARQ(data)
 		}
 	}
+}
+
+func (o *Outbound) sendWithARQ(data []byte) {
+	encrypted, err := o.cipher.Encrypt(data)
+	if err != nil {
+		return
+	}
+
+	o.fragmentor.FragmentWithCallback(encrypted, func(pb *proto.PoolBuffer) {
+		defer pb.Release()
+
+		seq := o.arq.NextSequence()
+		maskID := byte(o.mixer.GetCurrentMode())
+		frame := &proto.Frame{
+			Seq:     seq,
+			Ack:     0,
+			Flags:   proto.FrameFlagData,
+			MaskID:  maskID,
+			Payload: pb.Buf[:pb.Len],
+		}
+		frameData := frame.Encode()
+
+		masked := o.mixer.Wrap(frameData)
+		o.arq.StorePacket(seq, masked)
+
+		if _, err := o.udpConn.Write(masked); err != nil {
+			return
+		}
+	})
 }
 
 func (o *Outbound) Write(data []byte) (int, error) {
 	if o.conn != nil {
 		return o.conn.Write(data)
 	}
-	if o.packetConn != nil {
+	if o.udpConn != nil {
 		select {
 		case o.writeCh <- data:
 			return len(data), nil
 		default:
+			atomic.AddUint64(&o.dropCount, 1)
 			return 0, nil
 		}
 	}
@@ -176,13 +154,16 @@ func (o *Outbound) Write(data []byte) (int, error) {
 
 func (o *Outbound) Close() error {
 	close(o.closeCh)
+	if o.arq != nil {
+		o.arq.Stop()
+	}
 	o.wg.Wait()
 
 	if o.conn != nil {
 		o.conn.Close()
 	}
-	if o.packetConn != nil {
-		o.packetConn.Close()
+	if o.udpConn != nil {
+		o.udpConn.Close()
 	}
 	return nil
 }
@@ -193,7 +174,7 @@ func (o *Outbound) Conn() net.Conn {
 	if o.conn != nil {
 		return o.conn
 	}
-	return o.packetConn
+	return o.udpConn
 }
 
 func (o *Outbound) RemoteAddr() net.Addr {

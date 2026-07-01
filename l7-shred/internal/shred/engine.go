@@ -91,14 +91,23 @@ func (s *ShredEngine) Process(reader io.Reader, writer io.Writer) error {
 			data = s.mixer.Wrap(data)
 		}
 
-		bursts := s.shaper.Process(data)
+		var processErr error
+		s.shaper.Process(data, func(burst *PooledBuffer) {
+			if processErr != nil {
+				burst.Release()
+				return
+			}
 
-		for _, burst := range bursts {
-			fragments := s.fragmentor.Fragment(burst)
+			s.fragmentor.Fragment(burst.Bytes(), func(fragment *PooledBuffer) {
+				if processErr != nil {
+					fragment.Release()
+					return
+				}
 
-			for _, fragment := range fragments {
-				if _, err := writer.Write(fragment); err != nil {
-					return err
+				if _, err := writer.Write(fragment.Bytes()); err != nil {
+					processErr = err
+					fragment.Release()
+					return
 				}
 
 				s.jitter.Apply()
@@ -106,7 +115,15 @@ func (s *ShredEngine) Process(reader io.Reader, writer io.Writer) error {
 				if s.jitter.ShouldDrop() {
 					s.jitter.SimulatePacketLoss()
 				}
-			}
+
+				fragment.Release()
+			})
+
+			burst.Release()
+		})
+
+		if processErr != nil {
+			return processErr
 		}
 	}
 }
