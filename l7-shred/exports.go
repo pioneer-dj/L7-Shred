@@ -11,12 +11,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
 	"github.com/l7-shred/core/internal/tun"
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -50,6 +53,57 @@ type VPNStatus struct {
 	BytesOut    int64  `json:"bytes_out"`
 	Mode        string `json:"mode"`
 	ConnectedAt string `json:"connected_at"`
+}
+
+func runHiddenCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow: true,
+	}
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	return cmd.Run()
+}
+
+func runHiddenCommandWindows(name string, args ...string) error {
+	cmdLine := name
+	for _, arg := range args {
+		cmdLine += " " + arg
+	}
+	
+	var si windows.StartupInfo
+	si.Cb = uint32(unsafe.Sizeof(si))
+	si.Flags = windows.STARTF_USESHOWWINDOW
+	si.ShowWindow = windows.SW_HIDE
+	
+	var pi windows.ProcessInformation
+	
+	cmdPtr, err := windows.UTF16PtrFromString(cmdLine)
+	if err != nil {
+		return err
+	}
+	
+	err = windows.CreateProcess(
+		nil,
+		cmdPtr,
+		nil,
+		nil,
+		false,
+		windows.CREATE_NO_WINDOW,
+		nil,
+		nil,
+		&si,
+		&pi,
+	)
+	if err != nil {
+		return err
+	}
+	
+	defer windows.CloseHandle(pi.Process)
+	defer windows.CloseHandle(pi.Thread)
+	
+	windows.WaitForSingleObject(pi.Process, windows.INFINITE)
+	return nil
 }
 
 func cleanupResources() {
@@ -215,7 +269,7 @@ func StartVPN(configJSON *C.char) *C.char {
 	tunName := tunDev.Name()
 	log.Printf("TUN interface name: %s", tunName)
 
-	exec.Command("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1").Run()
+	runHiddenCommandWindows("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1")
 
 	if err := client.Start(); err != nil {
 		tunDev.Close()
@@ -312,11 +366,6 @@ func StopVPN() *C.char {
 
 	if clientInstance != nil {
 		log.Println("StopVPN: stopping client...")
-		if conn := clientInstance.GetConn(); conn != nil {
-			finPacket := []byte{0x00, 0x00, 0x00, 0x00}
-			conn.Write(finPacket)
-			time.Sleep(100 * time.Millisecond)
-		}
 		clientInstance.Stop()
 		clientInstance = nil
 	}
@@ -352,8 +401,6 @@ func GetStats() *C.char {
 	stats := clientInstance.GetStats()
 	lastStats = stats
 
-	log.Printf("GetStats raw: %+v", stats)
-
 	status := VPNStatus{
 		Status:      "connected",
 		ClientIP:    "10.0.0.2",
@@ -367,53 +414,10 @@ func GetStats() *C.char {
 		ConnectedAt: time.Now().Format(time.RFC3339),
 	}
 
-	if val, ok := stats["ping"]; ok {
-		switch v := val.(type) {
-		case int:
-			status.Ping = v
-		case float64:
-			status.Ping = int(v)
-		case int64:
-			status.Ping = int(v)
+	if pingVal, ok := stats["ping_ms"]; ok {
+		if pingFloat, ok := pingVal.(float64); ok {
+			status.Ping = int(pingFloat)
 		}
-	}
-
-	if val, ok := stats["latency"]; ok {
-		switch v := val.(type) {
-		case int:
-			if status.Ping == 0 {
-				status.Ping = v
-			}
-		case float64:
-			if status.Ping == 0 {
-				status.Ping = int(v)
-			}
-		case int64:
-			if status.Ping == 0 {
-				status.Ping = int(v)
-			}
-		}
-	}
-
-	if val, ok := stats["rtt"]; ok {
-		switch v := val.(type) {
-		case int:
-			if status.Ping == 0 {
-				status.Ping = v
-			}
-		case float64:
-			if status.Ping == 0 {
-				status.Ping = int(v)
-			}
-		case int64:
-			if status.Ping == 0 {
-				status.Ping = int(v)
-			}
-		}
-	}
-
-	if status.Ping == 0 {
-		status.Ping = 5
 	}
 
 	if speedInVal, ok := stats["speed_in_mbps"]; ok {
@@ -457,7 +461,6 @@ func GetStats() *C.char {
 	}
 
 	jsonData, _ := json.Marshal(status)
-	log.Printf("GetStats response: %s", string(jsonData))
 	return C.CString(string(jsonData))
 }
 
