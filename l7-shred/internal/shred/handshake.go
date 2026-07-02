@@ -113,118 +113,103 @@ func (h *Handshake) Verify() bool {
 }
 
 func (h *Handshake) Encode() []byte {
-    modesLen := len(h.Modes) * 4
-    // Базовый размер без опциональных полей: magic(4) + type(1) + version(1) + interval(4) + modesCount(1) + modes
-    buf := make([]byte, 4+1+1+4+1+modesLen)
-    offset := 0
+	modesLen := len(h.Modes) * 4
+	buf := make([]byte, 4+1+1+4+1+modesLen+4+8+16+8+1)
+	offset := 0
 
-    copy(buf[offset:offset+4], h.Magic[:])
-    offset += 4
+	copy(buf[offset:offset+4], h.Magic[:])
+	offset += 4
 
-    buf[offset] = byte(h.Type)
-    offset++
+	buf[offset] = byte(h.Type)
+	offset++
 
-    buf[offset] = h.Version
-    offset++
+	buf[offset] = h.Version
+	offset++
 
-    binary.BigEndian.PutUint32(buf[offset:offset+4], h.SwitchInterval)
-    offset += 4
+	binary.BigEndian.PutUint32(buf[offset:offset+4], h.SwitchInterval)
+	offset += 4
 
-    buf[offset] = h.ModesCount
-    offset++
+	buf[offset] = h.ModesCount
+	offset++
 
-    for _, mode := range h.Modes {
-        binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(mode))
-        offset += 4
-    }
+	for _, mode := range h.Modes {
+		binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(mode))
+		offset += 4
+	}
 
-    if h.CurrentMode != 0 {
-        buf = append(buf, make([]byte, 4+8+16+8+1)...)
-        binary.BigEndian.PutUint32(buf[offset:offset+4], h.CurrentMode)
-        offset += 4
-        binary.BigEndian.PutUint64(buf[offset:offset+8], h.Timestamp)
-        offset += 8
-        copy(buf[offset:offset+16], h.Nonce[:])
-        offset += 16
-        binary.BigEndian.PutUint64(buf[offset:offset+8], h.Sequence)
-        offset += 8
-        buf[offset] = h.Checksum
-    }
+	binary.BigEndian.PutUint32(buf[offset:offset+4], h.CurrentMode)
+	offset += 4
 
-    return buf
+	binary.BigEndian.PutUint64(buf[offset:offset+8], h.Timestamp)
+	offset += 8
+
+	copy(buf[offset:offset+16], h.Nonce[:])
+	offset += 16
+
+	binary.BigEndian.PutUint64(buf[offset:offset+8], h.Sequence)
+	offset += 8
+
+	buf[offset] = h.Checksum
+	return buf
 }
 
 func DecodeHandshake(data []byte) (*Handshake, error) {
-    if len(data) < 4+1+1+4+1 {
-        return nil, ErrInvalidHandshakeMagic
-    }
+	if len(data) < 4+1+1+4+1 {
+		return nil, ErrInvalidHandshakeMagic
+	}
 
-    h := &Handshake{}
-    offset := 0
+	h := &Handshake{}
+	offset := 0
 
-    copy(h.Magic[:], data[offset:offset+4])
-    offset += 4
+	copy(h.Magic[:], data[offset:offset+4])
+	offset += 4
 
-    h.Type = HandshakeType(data[offset])
-    offset++
+	h.Type = HandshakeType(data[offset])
+	offset++
 
-    h.Version = data[offset]
-    offset++
+	h.Version = data[offset]
+	offset++
 
-    h.SwitchInterval = binary.BigEndian.Uint32(data[offset : offset+4])
-    offset += 4
+	h.SwitchInterval = binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
 
-    h.ModesCount = data[offset]
-    offset++
+	h.ModesCount = data[offset]
+	offset++
 
-    // Проверка что данных достаточно для чтения modes
-    if len(data) < offset+int(h.ModesCount)*4 {
-        return nil, ErrInvalidHandshakeMagic
-    }
+	if len(data) < offset+int(h.ModesCount)*4 {
+		return nil, ErrInvalidHandshakeMagic
+	}
 
-    h.Modes = make([]ProtocolMode, h.ModesCount)
-    for i := byte(0); i < h.ModesCount; i++ {
-        mode := binary.BigEndian.Uint32(data[offset : offset+4])
-        h.Modes[i] = ProtocolMode(mode)
-        offset += 4
-    }
+	h.Modes = make([]ProtocolMode, h.ModesCount)
+	for i := byte(0); i < h.ModesCount; i++ {
+		mode := binary.BigEndian.Uint32(data[offset : offset+4])
+		h.Modes[i] = ProtocolMode(mode)
+		offset += 4
+	}
 
-    // CurrentMode (4 байта) - опционально, если данных хватает
-    if len(data) >= offset+4 {
-        h.CurrentMode = binary.BigEndian.Uint32(data[offset : offset+4])
-        offset += 4
-    } else {
-        h.CurrentMode = uint32(h.Modes[0]) // fallback на первую маску
-    }
+	if len(data) < offset+4+8+16+8+1 {
+		return nil, ErrInvalidHandshakeMagic
+	}
 
-    // Timestamp (8 байт) - опционально
-    if len(data) >= offset+8 {
-        h.Timestamp = binary.BigEndian.Uint64(data[offset : offset+8])
-        offset += 8
-    }
+	h.CurrentMode = binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
 
-    // Nonce (16 байт) - опционально
-    if len(data) >= offset+16 {
-        copy(h.Nonce[:], data[offset:offset+16])
-        offset += 16
-    }
+	h.Timestamp = binary.BigEndian.Uint64(data[offset : offset+8])
+	offset += 8
 
-    // Sequence (8 байт) - опционально
-    if len(data) >= offset+8 {
-        h.Sequence = binary.BigEndian.Uint64(data[offset : offset+8])
-        offset += 8
-    }
+	copy(h.Nonce[:], data[offset:offset+16])
+	offset += 16
 
-    // Checksum (1 байт) - опционально
-    if len(data) > offset {
-        h.Checksum = data[offset]
-    }
+	h.Sequence = binary.BigEndian.Uint64(data[offset : offset+8])
+	offset += 8
 
-    if !h.Verify() {
-        return nil, ErrHandshakeChecksumMismatch
-    }
+	h.Checksum = data[offset]
 
-    return h, nil
+	if !h.Verify() {
+		return nil, ErrHandshakeChecksumMismatch
+	}
+
+	return h, nil
 }
 
 type HandshakeState struct {
