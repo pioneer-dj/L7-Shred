@@ -3,11 +3,15 @@ package main
 import (
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/l7-shred/core/internal/api"
+	"github.com/l7-shred/core/internal/auth"
+	"github.com/l7-shred/core/internal/database"
 	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/transport"
 )
@@ -29,6 +33,19 @@ func main() {
 
 	log.Printf("Starting L7-Shred Server v%s", Version)
 
+	if err := database.InitDB(database.Config{
+		Host:     "localhost",
+		Port:     "5432",
+		User:     "l7shred_user",
+		Password: "secure_password_here",
+		DBName:   "l7shred",
+		SSLMode:  "disable",
+	}); err != nil {
+		log.Fatalf("Failed to init database: %v", err)
+	}
+
+	auth.InitJWT("your-super-secret-jwt-key-change-me-in-production")
+
 	cfg, err := transport.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -38,12 +55,21 @@ func main() {
 		log.Fatalf("Invalid config: %v", err)
 	}
 
+	router := api.SetupRoutes()
+
+	go func() {
+		log.Printf("API server listening on :8444")
+		if err := http.ListenAndServe(":8444", router); err != nil {
+			log.Printf("API server error: %v", err)
+		}
+	}()
+
 	server := engine.NewServer(cfg)
 
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
-	log.Printf("Server listening on %s (mode: %s)", cfg.ListenAddr, cfg.Mode)
+	log.Printf("VPN server listening on %s (mode: %s)", cfg.ListenAddr, cfg.Mode)
 
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
