@@ -8,28 +8,25 @@ import (
 	"encoding/json"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
 	"github.com/l7-shred/core/internal/tun"
-	"golang.org/x/sys/windows"
 )
 
 var (
 	clientInstance  *engine.Client
-	tunDevice       *tun.TunDevice
 	clientMutex     sync.Mutex
 	isRunning       bool
 	stopChan        chan struct{}
 	currentServerIP string
 	lastStats       map[string]interface{}
+	tunDevice       *tun.TunDevice
 	tunReaderDone   chan struct{}
 )
 
@@ -53,57 +50,6 @@ type VPNStatus struct {
 	BytesOut    int64  `json:"bytes_out"`
 	Mode        string `json:"mode"`
 	ConnectedAt string `json:"connected_at"`
-}
-
-func runHiddenCommand(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow: true,
-	}
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run()
-}
-
-func runHiddenCommandWindows(name string, args ...string) error {
-	cmdLine := name
-	for _, arg := range args {
-		cmdLine += " " + arg
-	}
-	
-	var si windows.StartupInfo
-	si.Cb = uint32(unsafe.Sizeof(si))
-	si.Flags = windows.STARTF_USESHOWWINDOW
-	si.ShowWindow = windows.SW_HIDE
-	
-	var pi windows.ProcessInformation
-	
-	cmdPtr, err := windows.UTF16PtrFromString(cmdLine)
-	if err != nil {
-		return err
-	}
-	
-	err = windows.CreateProcess(
-		nil,
-		cmdPtr,
-		nil,
-		nil,
-		false,
-		windows.CREATE_NO_WINDOW,
-		nil,
-		nil,
-		&si,
-		&pi,
-	)
-	if err != nil {
-		return err
-	}
-	
-	defer windows.CloseHandle(pi.Process)
-	defer windows.CloseHandle(pi.Thread)
-	
-	windows.WaitForSingleObject(pi.Process, windows.INFINITE)
-	return nil
 }
 
 func cleanupResources() {
@@ -165,9 +111,7 @@ func StartVPN(configJSON *C.char) *C.char {
 
 	modes := make([]shred.ProtocolMode, 0, len(flutterConfig.Modes))
 	if len(flutterConfig.Modes) == 0 {
-		modes = []shred.ProtocolMode{
-			shred.ModeVK,
-		}
+		modes = []shred.ProtocolMode{shred.ModeVK}
 	} else {
 		for _, m := range flutterConfig.Modes {
 			switch m {
@@ -197,17 +141,19 @@ func StartVPN(configJSON *C.char) *C.char {
 		}
 	}
 
-	exePath, err := os.Executable()
-	if err == nil {
-		exeDir := filepath.Dir(exePath)
-		os.Setenv("PATH", os.Getenv("PATH")+";"+exeDir)
-		log.Printf("Added %s to PATH for wintun.dll", exeDir)
-	}
+	if runtime.GOOS == "windows" {
+		exePath, err := os.Executable()
+		if err == nil {
+			exeDir := filepath.Dir(exePath)
+			os.Setenv("PATH", os.Getenv("PATH")+";"+exeDir)
+			log.Printf("Added %s to PATH for wintun.dll", exeDir)
+		}
 
-	workDir, err := os.Getwd()
-	if err == nil {
-		os.Setenv("PATH", os.Getenv("PATH")+";"+workDir)
-		log.Printf("Added %s to PATH for wintun.dll", workDir)
+		workDir, err := os.Getwd()
+		if err == nil {
+			os.Setenv("PATH", os.Getenv("PATH")+";"+workDir)
+			log.Printf("Added %s to PATH for wintun.dll", workDir)
+		}
 	}
 
 	clientConfig := &engine.ClientConfig{
@@ -251,29 +197,29 @@ func StartVPN(configJSON *C.char) *C.char {
 		return C.CString(`{"status":"error","message":"failed to create client"}`)
 	}
 
-	log.Println("Creating TUN device...")
-	tunDev, err := tun.NewTunDevice()
-	if err != nil {
-		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+	// TUN создаём только на Windows
+	if runtime.GOOS == "windows" {
+		log.Println("Creating TUN device...")
+		tunDev, err := tun.NewTunDevice()
+		if err != nil {
+			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+		}
+		tunDevice = tunDev
+
+		if err := tunDev.SetupIP("10.0.0.2"); err != nil {
+			tunDev.Close()
+			tunDevice = nil
+			cleanupResources()
+			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+		}
+		log.Printf("TUN device created, IP: 10.0.0.2")
 	}
-	tunDevice = tunDev
-
-	if err := tunDev.SetupIP("10.0.0.2"); err != nil {
-		tunDev.Close()
-		tunDevice = nil
-		cleanupResources()
-		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
-	}
-	log.Printf("TUN device created, IP: 10.0.0.2")
-
-	tunName := tunDev.Name()
-	log.Printf("TUN interface name: %s", tunName)
-
-	runHiddenCommandWindows("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1")
 
 	if err := client.Start(); err != nil {
-		tunDev.Close()
-		tunDevice = nil
+		if tunDevice != nil {
+			tunDevice.Close()
+			tunDevice = nil
+		}
 		cleanupResources()
 		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
 	}
@@ -282,8 +228,10 @@ func StartVPN(configJSON *C.char) *C.char {
 	for !client.IsConnected() {
 		if time.Now().After(timeout) {
 			client.Stop()
-			tunDev.Close()
-			tunDevice = nil
+			if tunDevice != nil {
+				tunDevice.Close()
+				tunDevice = nil
+			}
 			cleanupResources()
 			return C.CString(`{"status":"error","message":"connection timeout"}`)
 		}
@@ -293,34 +241,37 @@ func StartVPN(configJSON *C.char) *C.char {
 	log.Println("Client connected to server")
 
 	stopChan = make(chan struct{})
-	tunReaderDone = make(chan struct{})
 
-	go func() {
-		defer close(tunReaderDone)
-		log.Println("TUN reader: started")
-		for {
-			select {
-			case <-stopChan:
-				log.Println("TUN reader: stop signal received")
-				return
-			default:
+	// TUN reader только на Windows
+	if runtime.GOOS == "windows" && tunDevice != nil {
+		tunReaderDone = make(chan struct{})
+		go func() {
+			defer close(tunReaderDone)
+			log.Println("TUN reader: started")
+			for {
+				select {
+				case <-stopChan:
+					log.Println("TUN reader: stop signal received")
+					return
+				default:
+				}
+				data, err := tunDevice.Read()
+				if err != nil {
+					log.Printf("TUN read error: %v", err)
+					return
+				}
+				if len(data) == 0 {
+					continue
+				}
+				if client.IsConnected() {
+					client.Send(data)
+				}
 			}
-			data, err := tunDev.Read()
-			if err != nil {
-				log.Printf("TUN read error: %v", err)
-				return
-			}
-			if len(data) == 0 {
-				continue
-			}
-			if client.IsConnected() {
-				client.Send(data)
-			}
-		}
-	}()
+		}()
+	}
 
 	client.SetOnPacket(func(data []byte) {
-		if tunDevice != nil {
+		if runtime.GOOS == "windows" && tunDevice != nil {
 			tunDevice.Write(data)
 		}
 	})

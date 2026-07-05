@@ -1,3 +1,6 @@
+//go:build linux && !android
+// +build linux,!android
+
 package tun
 
 import (
@@ -41,7 +44,6 @@ func NewTunDevice() (*TunDevice, error) {
 	return &TunDevice{fd: fd, name: name}, nil
 }
 
-// ReadWithTimeout читает из TUN с таймаутом
 func (t *TunDevice) ReadWithTimeout(timeout time.Duration) ([]byte, error) {
 	type result struct {
 		data []byte
@@ -85,6 +87,5 @@ func (t *TunDevice) Name() string {
 }
 
 func (t *TunDevice) SetupIP(ip string) error {
-	// Linux уже настроен в NewTunDevice
 	return nil
 }
