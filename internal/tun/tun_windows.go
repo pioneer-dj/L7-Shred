@@ -6,6 +6,7 @@ package tun
 import (
 	"log"
 	"os/exec"
+	"syscall"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -30,6 +31,7 @@ func NewTunDevice() (*TunDevice, error) {
 
 	cmd := exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
 		name, "mtu=1350", "store=active")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	cmd.Run()
 
 	return &TunDevice{device: tunDev, name: name}, nil
@@ -66,6 +68,7 @@ func (t *TunDevice) Close() error {
 func (t *TunDevice) SetupIP(ip string) error {
 	cmd := exec.Command("netsh", "interface", "ip", "set", "address",
 		t.name, "static", ip, "255.255.255.0", "gateway=none")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Run(); err != nil {
 		return err
 	}

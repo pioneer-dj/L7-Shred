@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/l7-shred/core/internal/shred"
@@ -272,7 +273,9 @@ func (c *Client) setupRouting() error {
 }
 
 func (c *Client) getTUNInterfaceIndex() error {
-	out, err := exec.Command("netsh", "interface", "ip", "show", "interfaces").Output()
+	cmd := exec.Command("netsh", "interface", "ip", "show", "interfaces")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.Output()
 	if err != nil {
 		return err
 	}
@@ -298,10 +301,14 @@ func (c *Client) setupWindowsRouting() error {
 
 	c.getTUNInterfaceIndex()
 
-	exec.Command("cmd", "/c", "route delete 0.0.0.0").Run()
+	cmd := exec.Command("cmd", "/c", "route delete 0.0.0.0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.Run()
 
 	routeCmd := fmt.Sprintf("route add %s mask 255.255.255.255 %s metric 1", c.serverIP, c.defaultGateway)
-	if err := exec.Command("cmd", "/c", routeCmd).Run(); err != nil {
+	cmd = exec.Command("cmd", "/c", routeCmd)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Run(); err != nil {
 		log.Printf("[Windows] Failed to add server route: %v", err)
 	}
 
@@ -312,7 +319,9 @@ func (c *Client) setupWindowsRouting() error {
 		defaultRouteCmd = "route add 0.0.0.0 mask 0.0.0.0 10.0.0.1 metric 1"
 	}
 
-	if err := exec.Command("cmd", "/c", defaultRouteCmd).Run(); err != nil {
+	cmd = exec.Command("cmd", "/c", defaultRouteCmd)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Run(); err != nil {
 		log.Printf("[Windows] Failed to add default route: %v", err)
 	} else {
 		log.Printf("[Windows] Default route added via TUN (metric 1)")
@@ -330,8 +339,9 @@ func (c *Client) addRussianSubnetRoutes() {
 
 	added := 0
 	for _, subnet := range tun.RussianSubnets {
-		cmd := fmt.Sprintf("route add %s %s metric 1000", subnet, c.defaultGateway)
-		if err := exec.Command("cmd", "/c", cmd).Run(); err == nil {
+		cmd := exec.Command("cmd", "/c", "route add", subnet, c.defaultGateway, "metric", "1000")
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd.Run(); err == nil {
 			added++
 		}
 	}
@@ -377,7 +387,9 @@ func (c *Client) setupDarwinRouting() error {
 func (c *Client) saveDefaultRoute() error {
 	switch runtime.GOOS {
 	case "windows":
-		out, err := exec.Command("route", "print", "0.0.0.0").Output()
+		cmd := exec.Command("route", "print", "0.0.0.0")
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		out, err := cmd.Output()
 		if err != nil {
 			return err
 		}
@@ -710,10 +722,18 @@ func (c *Client) removeRoutes() {
 
 	switch runtime.GOOS {
 	case "windows":
-		exec.Command("cmd", "/c", "route delete "+c.serverIP).Run()
-		exec.Command("cmd", "/c", "route delete 0.0.0.0").Run()
+		cmd := exec.Command("cmd", "/c", "route delete "+c.serverIP)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		cmd.Run()
+
+		cmd = exec.Command("cmd", "/c", "route delete 0.0.0.0")
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		cmd.Run()
+
 		if c.defaultGateway != "" {
-			exec.Command("cmd", "/c", "route add 0.0.0.0 mask 0.0.0.0 "+c.defaultGateway+" metric 35").Run()
+			cmd = exec.Command("cmd", "/c", "route add 0.0.0.0 mask 0.0.0.0 "+c.defaultGateway+" metric 35")
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			cmd.Run()
 		}
 	case "linux":
 		exec.Command("ip", "route", "del", c.serverIP).Run()

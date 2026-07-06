@@ -9,8 +9,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/windows"
-
 	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
@@ -23,13 +21,8 @@ var (
 )
 
 func main() {
-	if !isAdmin() {
-		log.Println("Requesting administrator privileges...")
-		if err := runAsAdmin(); err != nil {
-			log.Fatalf("Failed to elevate: %v", err)
-		}
-		return
-	}
+	// UAC теперь обрабатывается через манифест Windows
+	// Проверка isAdmin() и runAsAdmin() больше не нужны
 
 	configPath := flag.String("config", "config_udp.json", "config file path")
 	tunAddr := flag.String("tun", "10.0.0.2", "TUN interface IP address")
@@ -55,7 +48,6 @@ func main() {
 	log.Printf("[DEBUG] SplitTunnel: %v", cfg.SplitTunnel)
 	log.Printf("[DEBUG] ReliableUDP: %v", cfg.ReliableUDP)
 
-	// --- Читаем modes из конфига ---
 	var modes []shred.ProtocolMode
 	if len(cfg.Modes) > 0 {
 		for _, m := range cfg.Modes {
@@ -86,7 +78,6 @@ func main() {
 			}
 		}
 	} else {
-		// fallback на полный список, если modes не указаны
 		modes = []shred.ProtocolMode{
 			shred.ModeVK, shred.ModeRuTube, shred.ModeYandex,
 			shred.ModeOzon, shred.ModeWildberries, shred.ModeSberID,
@@ -94,7 +85,6 @@ func main() {
 		}
 	}
 
-	// --- Читаем switch_interval из конфига (в секундах) ---
 	switchInterval := 5 * time.Minute
 	if cfg.SwitchInterval > 0 {
 		switchInterval = time.Duration(cfg.SwitchInterval) * time.Second
@@ -138,7 +128,6 @@ func main() {
 
 	client := engine.NewClient(clientConfig)
 
-	// Сначала создаём TUN интерфейс
 	log.Println("Creating TUN device...")
 	tunDev, err := tun.NewTunDevice()
 	if err != nil {
@@ -154,16 +143,15 @@ func main() {
 	tunName := tunDev.Name()
 	log.Printf("TUN interface name: %s", tunName)
 
-	// Устанавливаем низкий metric для TUN интерфейса
-	exec.Command("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1").Run()
+	cmd := exec.Command("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.Run()
 
-	// Теперь запускаем клиент (он настроит маршруты, зная что TUN существует)
 	if err := client.Start(); err != nil {
 		log.Fatalf("Failed to start client: %v", err)
 	}
 	log.Println("Client connected to server")
 
-	// Читаем из TUN и отправляем в VPN
 	go func() {
 		for {
 			data, err := tunDev.Read()
@@ -180,14 +168,12 @@ func main() {
 		}
 	}()
 
-	// Получаем из VPN и пишем в TUN
 	client.SetOnPacket(func(data []byte) {
 		if err := tunDev.Write(data); err != nil {
 			log.Printf("Failed to write to TUN: %v", err)
 		}
 	})
 
-	// Статистика
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
@@ -220,19 +206,4 @@ func validateConfig(cfg *transport.Config) error {
 		return flag.ErrHelp
 	}
 	return nil
-}
-
-func isAdmin() bool {
-	_, err := os.Open(`\\.\PHYSICALDRIVE0`)
-	return err == nil
-}
-
-func runAsAdmin() error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	verb, _ := windows.UTF16PtrFromString("runas")
-	file, _ := windows.UTF16PtrFromString(exe)
-	return windows.ShellExecute(0, verb, file, nil, nil, 1)
 }

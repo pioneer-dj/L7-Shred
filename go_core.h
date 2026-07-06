@@ -79,10 +79,12 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
+extern __declspec(dllexport) char* SetTunFileDescriptor(int fd);
 extern __declspec(dllexport) char* StartVPN(char* configJSON);
 extern __declspec(dllexport) char* StopVPN();
 extern __declspec(dllexport) char* GetStats();
 extern __declspec(dllexport) char* SetConfig(char* configJSON);
+extern __declspec(dllexport) void WriteTUN(GoSlice data);
 
 #ifdef __cplusplus
 }
