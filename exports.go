@@ -6,6 +6,7 @@ package main
 import "C"
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -28,7 +29,95 @@ var (
 	lastStats       map[string]interface{}
 	tunDevice       *tun.TunDevice
 	tunReaderDone   chan struct{}
+	
+	// Для Android - callback из Dart
+	onPacketCallback func([]byte)
 )
+
+//export SetOnPacketCallback
+func SetOnPacketCallback(callback func([]byte)) {
+	onPacketCallback = callback
+}
+
+//export SendToAndroidTun
+func SendToAndroidTun(data []byte) {
+	if tunDevice != nil {
+		tunDevice.Write(data)
+	}
+}
+
+//export SetTunFileDescriptor
+func SetTunFileDescriptor(fd C.int) *C.char {
+	if tunDevice == nil {
+		tunDev, err := tun.NewTunDevice()
+		if err != nil {
+			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+		}
+		tunDevice = tunDev
+	}
+
+	if err := tunDevice.SetFD(int(fd)); err != nil {
+		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+	}
+	if runtime.GOOS == "android" {
+		startAndroidTunReader()
+	}
+	return C.CString(`{"status":"ok"}`)
+}
+
+func forwardTunPackets(stop <-chan struct{}, readFn func() ([]byte, error), sender interface{ Send([]byte) error }, onExit func()) {
+	defer func() {
+		if onExit != nil {
+			onExit()
+		}
+	}()
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		data, err := readFn()
+		if err != nil {
+			if err == io.EOF || err == os.ErrClosed {
+				return
+			}
+			if err != nil {
+				log.Printf("tun read error: %v", err)
+				return
+			}
+		}
+		if len(data) == 0 {
+			continue
+		}
+		if sender != nil && clientInstance != nil && clientInstance.IsConnected() {
+			sender.Send(data)
+		}
+	}
+}
+
+func startAndroidTunReader() {
+	if tunReaderDone != nil || stopChan == nil || tunDevice == nil || clientInstance == nil || !clientInstance.IsConnected() {
+		return
+	}
+
+	tunReaderDone = make(chan struct{})
+	go func() {
+		defer close(tunReaderDone)
+		log.Println("Android TUN reader: started")
+		forwardTunPackets(stopChan, func() ([]byte, error) {
+			return tunDevice.Read()
+		}, clientInstance, nil)
+		log.Println("Android TUN reader: stopped")
+	}()
+}
+
+//export WriteTUN
+func WriteTUN(data []byte) {
+	if clientInstance != nil && clientInstance.IsConnected() {
+		clientInstance.Send(data)
+	}
+}
 
 type FlutterConfig struct {
 	Server      string   `json:"server"`
@@ -148,7 +237,6 @@ func StartVPN(configJSON *C.char) *C.char {
 			os.Setenv("PATH", os.Getenv("PATH")+";"+exeDir)
 			log.Printf("Added %s to PATH for wintun.dll", exeDir)
 		}
-
 		workDir, err := os.Getwd()
 		if err == nil {
 			os.Setenv("PATH", os.Getenv("PATH")+";"+workDir)
@@ -197,7 +285,7 @@ func StartVPN(configJSON *C.char) *C.char {
 		return C.CString(`{"status":"error","message":"failed to create client"}`)
 	}
 
-	// TUN создаём только на Windows
+	// TUN только на Windows
 	if runtime.GOOS == "windows" {
 		log.Println("Creating TUN device...")
 		tunDev, err := tun.NewTunDevice()
@@ -205,7 +293,6 @@ func StartVPN(configJSON *C.char) *C.char {
 			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
 		}
 		tunDevice = tunDev
-
 		if err := tunDev.SetupIP("10.0.0.2"); err != nil {
 			tunDev.Close()
 			tunDevice = nil
@@ -213,6 +300,13 @@ func StartVPN(configJSON *C.char) *C.char {
 			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
 		}
 		log.Printf("TUN device created, IP: 10.0.0.2")
+	} else if runtime.GOOS == "android" {
+		tunDev, err := tun.NewTunDevice()
+		if err != nil {
+			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+		}
+		tunDevice = tunDev
+		log.Println("Android TUN device initialized")
 	}
 
 	if err := client.Start(); err != nil {
@@ -242,7 +336,6 @@ func StartVPN(configJSON *C.char) *C.char {
 
 	stopChan = make(chan struct{})
 
-	// TUN reader только на Windows
 	if runtime.GOOS == "windows" && tunDevice != nil {
 		tunReaderDone = make(chan struct{})
 		go func() {
@@ -271,8 +364,10 @@ func StartVPN(configJSON *C.char) *C.char {
 	}
 
 	client.SetOnPacket(func(data []byte) {
-		if runtime.GOOS == "windows" && tunDevice != nil {
+		if tunDevice != nil {
 			tunDevice.Write(data)
+		} else if runtime.GOOS == "android" && onPacketCallback != nil {
+			onPacketCallback(data)
 		}
 	})
 
