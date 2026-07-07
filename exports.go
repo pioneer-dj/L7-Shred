@@ -77,9 +77,6 @@ func cleanupResources() {
 
 //export SetTunFileDescriptor
 func SetTunFileDescriptor(fd C.int) *C.char {
-	// Этот метод используется только на Android
-	// На Windows TUN создается внутри StartVPN
-	// Возвращаем успешный ответ для совместимости
 	return C.CString(`{"status":"ok"}`)
 }
 
@@ -204,7 +201,6 @@ func StartVPN(configJSON *C.char) *C.char {
 		return C.CString(`{"status":"error","message":"failed to create client"}`)
 	}
 
-	// TUN только на Windows
 	if runtime.GOOS == "windows" {
 		log.Println("Creating TUN device...")
 		tunDev, err := tun.NewTunDevice()
@@ -269,7 +265,10 @@ func StartVPN(configJSON *C.char) *C.char {
 					continue
 				}
 				if client.IsConnected() {
-					client.Send(data)
+					err := client.Send(data)
+					if err != nil {
+						log.Printf("Send error: %v", err)
+					}
 				}
 			}
 		}()

@@ -65,62 +65,70 @@ func (o *Outbound) connectTCP() error {
 func (o *Outbound) connectUDP() error {
 	log.Printf("[UDP] Connecting to %s", o.config.ServerAddr)
 
-	conn, err := net.Dial("udp", o.config.ServerAddr)
+	remoteAddr, err := net.ResolveUDPAddr("udp", o.config.ServerAddr)
 	if err != nil {
 		return err
 	}
+
+	localAddr := &net.UDPAddr{
+		IP:   net.IPv4(0, 0, 0, 0),
+		Port: 0,
+	}
+
+	conn, err := net.DialUDP("udp", localAddr, remoteAddr)
+	if err != nil {
+		return err
+	}
+
 	o.packetConn = conn
+	o.remoteAddr = remoteAddr
+	o.conn = conn
 
-	addr, err := net.ResolveUDPAddr("udp", o.config.ServerAddr)
-	if err != nil {
-		return err
-	}
-	o.remoteAddr = addr
-
-	log.Printf("[UDP] Connected to %s", o.config.ServerAddr)
+	log.Printf("[UDP] Connected to %s from %s", o.config.ServerAddr, conn.LocalAddr())
 	return nil
 }
 
 func (o *Outbound) connectReliableUDP() error {
-    log.Printf("[ReliableUDP] Connecting to %s", o.config.ServerAddr)
+	log.Printf("[ReliableUDP] Connecting to %s", o.config.ServerAddr)
 
-    windowSize := 1024
-    if o.config.WindowSize > 0 {
-        windowSize = o.config.WindowSize
-    }
+	windowSize := 1024
+	if o.config.WindowSize > 0 {
+		windowSize = o.config.WindowSize
+	}
 
-    readBuffer := 4194304
-    if o.config.ReadBuffer > 0 {
-        readBuffer = o.config.ReadBuffer
-    }
+	readBuffer := 4194304
+	if o.config.ReadBuffer > 0 {
+		readBuffer = o.config.ReadBuffer
+	}
 
-    writeBuffer := 4194304
-    if o.config.WriteBuffer > 0 {
-        writeBuffer = o.config.WriteBuffer
-    }
+	writeBuffer := 4194304
+	if o.config.WriteBuffer > 0 {
+		writeBuffer = o.config.WriteBuffer
+	}
 
-    kcpConn, err := kcp.DialWithOptions(o.config.ServerAddr, nil, 10, 3)
-    if err != nil {
-        return err
-    }
+	kcpConn, err := kcp.DialWithOptions(o.config.ServerAddr, nil, 10, 3)
+	if err != nil {
+		return err
+	}
 
-    kcpConn.SetStreamMode(false)
-    kcpConn.SetWindowSize(windowSize, windowSize)
-    kcpConn.SetNoDelay(1, 10, 2, 1)
-    kcpConn.SetMtu(o.config.MTU)
-    kcpConn.SetReadBuffer(readBuffer)
-    kcpConn.SetWriteBuffer(writeBuffer)
-    kcpConn.SetACKNoDelay(true)
+	kcpConn.SetStreamMode(false)
+	kcpConn.SetWindowSize(windowSize, windowSize)
+	kcpConn.SetNoDelay(1, 10, 2, 1)
+	kcpConn.SetMtu(o.config.MTU)
+	kcpConn.SetReadBuffer(readBuffer)
+	kcpConn.SetWriteBuffer(writeBuffer)
+	kcpConn.SetACKNoDelay(true)
 
-    o.packetConn = kcpConn
-    o.remoteAddr = kcpConn.RemoteAddr()
+	o.packetConn = kcpConn
+	o.remoteAddr = kcpConn.RemoteAddr()
+	o.conn = kcpConn
 
-    o.wg.Add(1)
-    go o.writeLoop()
+	o.wg.Add(1)
+	go o.writeLoop()
 
-    log.Printf("[ReliableUDP] Connected (window=%d, buffer=%d, mtu=%d)", 
-        windowSize, readBuffer, o.config.MTU)
-    return nil
+	log.Printf("[ReliableUDP] Connected from %s (window=%d, buffer=%d, mtu=%d)",
+		kcpConn.LocalAddr(), windowSize, readBuffer, o.config.MTU)
+	return nil
 }
 
 func (o *Outbound) keepAliveLoop(conn net.Conn) {

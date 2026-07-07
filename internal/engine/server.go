@@ -10,6 +10,7 @@ import (
 	"github.com/l7-shred/core/internal/shred"
 	"github.com/l7-shred/core/internal/transport"
 	"github.com/l7-shred/core/internal/tun"
+	"github.com/xtaci/kcp-go/v5"
 )
 
 type Server struct {
@@ -95,8 +96,6 @@ func (s *Server) tunLoop() {
 
 		data, err := s.tunDev.Read()
 		if err != nil {
-			s.logger.Printf("TUN read error: %v", err)
-			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		if len(data) == 0 {
@@ -107,7 +106,7 @@ func (s *Server) tunLoop() {
 		for _, sc := range s.connections {
 			wrapped := sc.Session.Wrap(data)
 			sc.writeMu.Lock()
-			err := writeFrame(sc.Conn, wrapped)
+			_, err := sc.Conn.Write(wrapped)
 			sc.writeMu.Unlock()
 			if err != nil {
 				s.logger.Printf("Failed to write to client %d: %v", sc.ID, err)
@@ -127,7 +126,6 @@ func (s *Server) acceptLoop() {
 
 		conn, err := s.inbound.Accept()
 		if err != nil {
-			s.logger.Printf("Accept error: %v", err)
 			continue
 		}
 
@@ -141,6 +139,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	if kcpConn, ok := conn.(*kcp.UDPSession); ok {
+		kcpConn.SetStreamMode(false)
+		kcpConn.SetWindowSize(4096, 4096)
+		kcpConn.SetNoDelay(1, 10, 2, 1)
+		kcpConn.SetMtu(1400)
+		kcpConn.SetReadBuffer(16777216)
+		kcpConn.SetWriteBuffer(16777216)
+		kcpConn.SetACKNoDelay(true)
 	}
 
 	s.logger.Printf("New connection from %s", conn.RemoteAddr())
@@ -182,10 +190,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) handleDataExchange(sc *ServerConnection) {
-	scratch := make([]byte, 65536)
-
-	sc.Conn.SetReadDeadline(time.Time{})
-	sc.Conn.SetWriteDeadline(time.Time{})
+	buf := make([]byte, 65536)
 
 	for {
 		select {
@@ -194,10 +199,32 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 		default:
 		}
 
-		data, err := readFrame(sc.Conn, scratch)
-		if err != nil {
-			s.logger.Printf("Read error from session %d: %v", sc.ID, err)
-			return
+		sc.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+		var data []byte
+		var err error
+
+		if _, ok := sc.Conn.(*kcp.UDPSession); ok {
+			n, readErr := sc.Conn.Read(buf)
+			if readErr != nil {
+				if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				s.logger.Printf("Read error from session %d: %v", sc.ID, readErr)
+				return
+			}
+			data = buf[:n]
+		} else {
+			var frameData []byte
+			frameData, err = readFrame(sc.Conn, buf)
+			if err != nil {
+				return
+			}
+			data = frameData
+		}
+
+		if len(data) == 0 {
+			continue
 		}
 
 		sc.mu.Lock()
@@ -209,8 +236,16 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 
 		unwrapped, err := sc.Session.Unwrap(data)
 		if err != nil {
-			s.logger.Printf("Unwrap error from session %d: %v", sc.ID, err)
-			continue
+			if len(data) >= 20 {
+				version := (data[0] >> 4) & 0x0F
+				if version == 4 || version == 6 {
+					unwrapped = data
+				} else {
+					continue
+				}
+			} else {
+				continue
+			}
 		}
 
 		if len(unwrapped) < 20 {
@@ -220,13 +255,6 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 		version := (unwrapped[0] >> 4) & 0x0F
 		if version != 4 && version != 6 {
 			continue
-		}
-
-		if version == 4 {
-			headerLen := int(unwrapped[0]&0x0F) * 4
-			if len(unwrapped) < headerLen {
-				continue
-			}
 		}
 
 		if s.tunDev != nil {
@@ -249,7 +277,7 @@ func (s *Server) SendToSession(sessionID uint64, data []byte) error {
 	wrapped := sc.Session.Wrap(data)
 
 	sc.writeMu.Lock()
-	err := writeFrame(sc.Conn, wrapped)
+	_, err := sc.Conn.Write(wrapped)
 	sc.writeMu.Unlock()
 
 	sc.mu.Lock()

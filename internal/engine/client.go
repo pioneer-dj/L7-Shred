@@ -10,8 +10,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
+	"sync"
 	"time"
 
 	"github.com/l7-shred/core/internal/shred"
@@ -274,7 +274,9 @@ func (c *Client) setupRouting() error {
 
 func (c *Client) getTUNInterfaceIndex() error {
 	cmd := exec.Command("netsh", "interface", "ip", "show", "interfaces")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return err
@@ -302,12 +304,16 @@ func (c *Client) setupWindowsRouting() error {
 	c.getTUNInterfaceIndex()
 
 	cmd := exec.Command("cmd", "/c", "route delete 0.0.0.0")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	}
 	cmd.Run()
 
 	routeCmd := fmt.Sprintf("route add %s mask 255.255.255.255 %s metric 1", c.serverIP, c.defaultGateway)
 	cmd = exec.Command("cmd", "/c", routeCmd)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	}
 	if err := cmd.Run(); err != nil {
 		log.Printf("[Windows] Failed to add server route: %v", err)
 	}
@@ -320,7 +326,9 @@ func (c *Client) setupWindowsRouting() error {
 	}
 
 	cmd = exec.Command("cmd", "/c", defaultRouteCmd)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	}
 	if err := cmd.Run(); err != nil {
 		log.Printf("[Windows] Failed to add default route: %v", err)
 	} else {
@@ -340,7 +348,9 @@ func (c *Client) addRussianSubnetRoutes() {
 	added := 0
 	for _, subnet := range tun.RussianSubnets {
 		cmd := exec.Command("cmd", "/c", "route add", subnet, c.defaultGateway, "metric", "1000")
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if runtime.GOOS == "windows" {
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		}
 		if err := cmd.Run(); err == nil {
 			added++
 		}
@@ -388,7 +398,9 @@ func (c *Client) saveDefaultRoute() error {
 	switch runtime.GOOS {
 	case "windows":
 		cmd := exec.Command("route", "print", "0.0.0.0")
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if runtime.GOOS == "windows" {
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		}
 		out, err := cmd.Output()
 		if err != nil {
 			return err
@@ -451,6 +463,15 @@ func (c *Client) performHandshake() error {
 }
 
 func (c *Client) getConn() net.Conn {
+	if c.outbound == nil {
+		return nil
+	}
+	return c.outbound.Conn()
+}
+
+func (c *Client) GetConn() net.Conn {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.outbound == nil {
 		return nil
 	}
@@ -723,16 +744,22 @@ func (c *Client) removeRoutes() {
 	switch runtime.GOOS {
 	case "windows":
 		cmd := exec.Command("cmd", "/c", "route delete "+c.serverIP)
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if runtime.GOOS == "windows" {
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		}
 		cmd.Run()
 
 		cmd = exec.Command("cmd", "/c", "route delete 0.0.0.0")
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if runtime.GOOS == "windows" {
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		}
 		cmd.Run()
 
 		if c.defaultGateway != "" {
 			cmd = exec.Command("cmd", "/c", "route add 0.0.0.0 mask 0.0.0.0 "+c.defaultGateway+" metric 35")
-			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			if runtime.GOOS == "windows" {
+				cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			}
 			cmd.Run()
 		}
 	case "linux":
