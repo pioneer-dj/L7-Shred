@@ -20,14 +20,15 @@ import (
 )
 
 var (
-	clientInstance  *engine.Client
-	clientMutex     sync.Mutex
-	isRunning       bool
-	stopChan        chan struct{}
-	currentServerIP string
-	lastStats       map[string]interface{}
-	tunDevice       *tun.TunDevice
-	tunReaderDone   chan struct{}
+	clientInstance   *engine.Client
+	clientMutex      sync.Mutex
+	isRunning        bool
+	stopChan         chan struct{}
+	currentServerIP  string
+	lastStats        map[string]interface{}
+	tunDevice        *tun.TunDevice
+	tunReaderDone    chan struct{}
+	onPacketCallback func([]byte)
 )
 
 type FlutterConfig struct {
@@ -75,9 +76,63 @@ func cleanupResources() {
 	isRunning = false
 }
 
+//export SetOnPacketCallback
+func SetOnPacketCallback(callback func([]byte)) {
+	onPacketCallback = callback
+}
+
 //export SetTunFileDescriptor
 func SetTunFileDescriptor(fd C.int) *C.char {
+	log.Printf("SetTunFileDescriptor: fd=%d", fd)
+
+	if tunDevice == nil {
+		tunDev, err := tun.NewTunDevice()
+		if err != nil {
+			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+		}
+		tunDevice = tunDev
+	}
+
+	if err := tunDevice.SetFD(int(fd)); err != nil {
+		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+	}
+
+	log.Printf("SetTunFileDescriptor: FD set successfully")
+
+	if runtime.GOOS == "android" && clientInstance != nil && clientInstance.IsConnected() {
+		go startAndroidTunReader()
+	}
+
 	return C.CString(`{"status":"ok"}`)
+}
+
+func startAndroidTunReader() {
+	if tunDevice == nil || clientInstance == nil || !clientInstance.IsConnected() {
+		log.Println("Android TUN reader: not ready")
+		return
+	}
+
+	log.Println("Android TUN reader: started")
+	for {
+		select {
+		case <-stopChan:
+			log.Println("Android TUN reader: stop signal received")
+			return
+		default:
+		}
+
+		data, err := tunDevice.Read()
+		if err != nil {
+			log.Printf("Android TUN read error: %v", err)
+			return
+		}
+		if len(data) == 0 {
+			continue
+		}
+		if clientInstance.IsConnected() {
+			clientInstance.Send(data)
+		}
+	}
 }
 
 //export StartVPN
@@ -265,10 +320,7 @@ func StartVPN(configJSON *C.char) *C.char {
 					continue
 				}
 				if client.IsConnected() {
-					err := client.Send(data)
-					if err != nil {
-						log.Printf("Send error: %v", err)
-					}
+					client.Send(data)
 				}
 			}
 		}()
@@ -277,6 +329,8 @@ func StartVPN(configJSON *C.char) *C.char {
 	client.SetOnPacket(func(data []byte) {
 		if tunDevice != nil {
 			tunDevice.Write(data)
+		} else if runtime.GOOS == "android" && onPacketCallback != nil {
+			onPacketCallback(data)
 		}
 	})
 

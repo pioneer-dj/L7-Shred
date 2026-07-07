@@ -113,118 +113,111 @@ func (h *Handshake) Verify() bool {
 }
 
 func (h *Handshake) Encode() []byte {
-    modesLen := len(h.Modes) * 4
-    // Базовый размер без опциональных полей: magic(4) + type(1) + version(1) + interval(4) + modesCount(1) + modes
-    buf := make([]byte, 4+1+1+4+1+modesLen)
-    offset := 0
+	modesLen := len(h.Modes) * 4
+	buf := make([]byte, 4+1+1+4+1+modesLen)
+	offset := 0
 
-    copy(buf[offset:offset+4], h.Magic[:])
-    offset += 4
+	copy(buf[offset:offset+4], h.Magic[:])
+	offset += 4
 
-    buf[offset] = byte(h.Type)
-    offset++
+	buf[offset] = byte(h.Type)
+	offset++
 
-    buf[offset] = h.Version
-    offset++
+	buf[offset] = h.Version
+	offset++
 
-    binary.BigEndian.PutUint32(buf[offset:offset+4], h.SwitchInterval)
-    offset += 4
+	binary.BigEndian.PutUint32(buf[offset:offset+4], h.SwitchInterval)
+	offset += 4
 
-    buf[offset] = h.ModesCount
-    offset++
+	buf[offset] = h.ModesCount
+	offset++
 
-    for _, mode := range h.Modes {
-        binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(mode))
-        offset += 4
-    }
+	for _, mode := range h.Modes {
+		binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(mode))
+		offset += 4
+	}
 
-    if h.CurrentMode != 0 {
-        buf = append(buf, make([]byte, 4+8+16+8+1)...)
-        binary.BigEndian.PutUint32(buf[offset:offset+4], h.CurrentMode)
-        offset += 4
-        binary.BigEndian.PutUint64(buf[offset:offset+8], h.Timestamp)
-        offset += 8
-        copy(buf[offset:offset+16], h.Nonce[:])
-        offset += 16
-        binary.BigEndian.PutUint64(buf[offset:offset+8], h.Sequence)
-        offset += 8
-        buf[offset] = h.Checksum
-    }
+	if h.CurrentMode != 0 {
+		buf = append(buf, make([]byte, 4+8+16+8+1)...)
+		binary.BigEndian.PutUint32(buf[offset:offset+4], h.CurrentMode)
+		offset += 4
+		binary.BigEndian.PutUint64(buf[offset:offset+8], h.Timestamp)
+		offset += 8
+		copy(buf[offset:offset+16], h.Nonce[:])
+		offset += 16
+		binary.BigEndian.PutUint64(buf[offset:offset+8], h.Sequence)
+		offset += 8
+		buf[offset] = h.Checksum
+	}
 
-    return buf
+	return buf
 }
 
 func DecodeHandshake(data []byte) (*Handshake, error) {
-    if len(data) < 4+1+1+4+1 {
-        return nil, ErrInvalidHandshakeMagic
-    }
+	if len(data) < 4+1+1+4+1 {
+		return nil, ErrInvalidHandshakeMagic
+	}
 
-    h := &Handshake{}
-    offset := 0
+	h := &Handshake{}
+	offset := 0
 
-    copy(h.Magic[:], data[offset:offset+4])
-    offset += 4
+	copy(h.Magic[:], data[offset:offset+4])
+	offset += 4
 
-    h.Type = HandshakeType(data[offset])
-    offset++
+	h.Type = HandshakeType(data[offset])
+	offset++
 
-    h.Version = data[offset]
-    offset++
+	h.Version = data[offset]
+	offset++
 
-    h.SwitchInterval = binary.BigEndian.Uint32(data[offset : offset+4])
-    offset += 4
+	h.SwitchInterval = binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
 
-    h.ModesCount = data[offset]
-    offset++
+	h.ModesCount = data[offset]
+	offset++
 
-    // Проверка что данных достаточно для чтения modes
-    if len(data) < offset+int(h.ModesCount)*4 {
-        return nil, ErrInvalidHandshakeMagic
-    }
+	if len(data) < offset+int(h.ModesCount)*4 {
+		return nil, ErrInvalidHandshakeMagic
+	}
 
-    h.Modes = make([]ProtocolMode, h.ModesCount)
-    for i := byte(0); i < h.ModesCount; i++ {
-        mode := binary.BigEndian.Uint32(data[offset : offset+4])
-        h.Modes[i] = ProtocolMode(mode)
-        offset += 4
-    }
+	h.Modes = make([]ProtocolMode, h.ModesCount)
+	for i := byte(0); i < h.ModesCount; i++ {
+		mode := binary.BigEndian.Uint32(data[offset : offset+4])
+		h.Modes[i] = ProtocolMode(mode)
+		offset += 4
+	}
 
-    // CurrentMode (4 байта) - опционально, если данных хватает
-    if len(data) >= offset+4 {
-        h.CurrentMode = binary.BigEndian.Uint32(data[offset : offset+4])
-        offset += 4
-    } else {
-        h.CurrentMode = uint32(h.Modes[0]) // fallback на первую маску
-    }
+	if len(data) >= offset+4 {
+		h.CurrentMode = binary.BigEndian.Uint32(data[offset : offset+4])
+		offset += 4
+	} else {
+		h.CurrentMode = uint32(h.Modes[0])
+	}
 
-    // Timestamp (8 байт) - опционально
-    if len(data) >= offset+8 {
-        h.Timestamp = binary.BigEndian.Uint64(data[offset : offset+8])
-        offset += 8
-    }
+	if len(data) >= offset+8 {
+		h.Timestamp = binary.BigEndian.Uint64(data[offset : offset+8])
+		offset += 8
+	}
 
-    // Nonce (16 байт) - опционально
-    if len(data) >= offset+16 {
-        copy(h.Nonce[:], data[offset:offset+16])
-        offset += 16
-    }
+	if len(data) >= offset+16 {
+		copy(h.Nonce[:], data[offset:offset+16])
+		offset += 16
+	}
 
-    // Sequence (8 байт) - опционально
-    if len(data) >= offset+8 {
-        h.Sequence = binary.BigEndian.Uint64(data[offset : offset+8])
-        offset += 8
-    }
+	if len(data) >= offset+8 {
+		h.Sequence = binary.BigEndian.Uint64(data[offset : offset+8])
+		offset += 8
+	}
 
-    // Checksum (1 байт) - опционально
-    if len(data) > offset {
-        h.Checksum = data[offset]
-    }
+	if len(data) > offset {
+		h.Checksum = data[offset]
+	}
 
-    if !h.Verify() {
-        return nil, ErrHandshakeChecksumMismatch
-    }
+	if !h.Verify() {
+		return nil, ErrHandshakeChecksumMismatch
+	}
 
-    return h, nil
+	return h, nil
 }
 
 type HandshakeState struct {
@@ -289,85 +282,6 @@ func NewHandshakeManager(authKey []byte, timeout time.Duration) *HandshakeManage
 		state:   NewHandshakeState(),
 		authKey: authKey,
 		timeout: timeout,
-	}
-}
-
-func (hm *HandshakeManager) PerformClientHandshakeAsync(conn net.Conn, interval time.Duration, modes []ProtocolMode, currentMode ProtocolMode, readChan <-chan []byte, errChan chan error, timeout time.Duration) error {
-	log.Printf("[Handshake] ========== CLIENT HANDSHAKE ASYNC START ==========")
-	log.Printf("[Handshake] Connection: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
-	log.Printf("[Handshake] Interval: %v, Modes: %v, CurrentMode: %v", interval, modes, currentMode)
-
-	seq := hm.state.NextSequence()
-	log.Printf("[Handshake] Using sequence: %d", seq)
-
-	syn := NewHandshake(HandshakeSyn, interval, modes, currentMode, seq)
-	synData := syn.Encode()
-	log.Printf("[Handshake] SynData length: %d", len(synData))
-
-	signature := hm.sign(synData)
-	log.Printf("[Handshake] Signature length: %d", len(signature))
-
-	packet := append(synData, signature...)
-	log.Printf("[Handshake] Total packet length: %d", len(packet))
-
-	log.Printf("[Handshake] Sending SYN to server (with retries)...")
-	for i := 0; i < 3; i++ {
-		if _, err := conn.Write(packet); err != nil {
-			log.Printf("[Handshake] Write error (attempt %d): %v", i+1, err)
-		} else {
-			log.Printf("[Handshake] Wrote %d bytes (attempt %d)", len(packet), i+1)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	log.Printf("[Handshake] Waiting for ACK via channel (timeout: %v)", timeout)
-
-	select {
-	case ackData := <-readChan:
-		log.Printf("[Handshake] Received %d bytes from channel", len(ackData))
-
-		if len(ackData) < 32 {
-			log.Printf("[Handshake] Response too short: %d bytes", len(ackData))
-			return ErrAuthFailed
-		}
-
-		ackPayload := ackData[:len(ackData)-32]
-		ackSignature := ackData[len(ackData)-32:]
-
-		if !hm.verify(ackPayload, ackSignature) {
-			log.Printf("[Handshake] ACK signature verification failed")
-			return ErrAuthFailed
-		}
-		log.Printf("[Handshake] ACK signature verified")
-
-		ack, err := DecodeHandshake(ackPayload)
-		if err != nil {
-			log.Printf("[Handshake] Decode error: %v", err)
-			return err
-		}
-		log.Printf("[Handshake] ACK decoded: Type=%d, Sequence=%d", ack.Type, ack.Sequence)
-
-		if ack.Type != HandshakeAck {
-			log.Printf("[Handshake] Wrong response type: %d, expected %d", ack.Type, HandshakeAck)
-			return ErrAuthFailed
-		}
-
-		if hm.state.IsReplay(ack.Sequence, 30*time.Second) {
-			log.Printf("[Handshake] Replay detected for sequence %d", ack.Sequence)
-			return ErrHandshakeReplay
-		}
-
-		hm.state.MarkSeen(ack.Sequence)
-		log.Printf("[Handshake] ========== CLIENT HANDSHAKE SUCCESS ==========")
-		return nil
-
-	case err := <-errChan:
-		log.Printf("[Handshake] Error from channel: %v", err)
-		return err
-
-	case <-time.After(timeout):
-		log.Printf("[Handshake] Timeout waiting for ACK")
-		return ErrHandshakeTimeout
 	}
 }
 

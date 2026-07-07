@@ -3,7 +3,10 @@
 
 package tun
 
-import "os"
+import (
+	"log"
+	"os"
+)
 
 var (
 	onPacketFunc func([]byte)
@@ -37,6 +40,7 @@ func (t *TunDevice) SetFD(fd int) error {
 		return os.ErrInvalid
 	}
 	t.fd = os.NewFile(uintptr(fd), "tun0")
+	log.Printf("Android TUN: FD set to %d", fd)
 	return nil
 }
 
