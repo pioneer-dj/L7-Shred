@@ -53,6 +53,16 @@ type VPNStatus struct {
 	ConnectedAt string `json:"connected_at"`
 }
 
+func init() {
+	// Настройка логов в файл и консоль одновременно
+	logFile, err := os.OpenFile("vpn.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		log.SetOutput(logFile)
+	} else {
+		log.SetOutput(os.Stdout)
+	}
+}
+
 func cleanupResources() {
 	if stopChan != nil {
 		close(stopChan)
@@ -83,26 +93,6 @@ func SetOnPacketCallback(callback func([]byte)) {
 
 //export SetTunFileDescriptor
 func SetTunFileDescriptor(fd C.int) *C.char {
-	log.Printf("SetTunFileDescriptor: fd=%d", fd)
-
-	if tunDevice == nil {
-		tunDev, err := tun.NewTunDevice()
-		if err != nil {
-			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
-		}
-		tunDevice = tunDev
-	}
-
-	if err := tunDevice.SetFD(int(fd)); err != nil {
-		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
-	}
-
-	log.Printf("SetTunFileDescriptor: FD set successfully")
-
-	if runtime.GOOS == "android" && clientInstance != nil && clientInstance.IsConnected() {
-		go startAndroidTunReader()
-	}
-
 	return C.CString(`{"status":"ok"}`)
 }
 
@@ -137,25 +127,36 @@ func startAndroidTunReader() {
 
 //export StartVPN
 func StartVPN(configJSON *C.char) *C.char {
+	log.Println("========================================")
+	log.Println("StartVPN: called")
+	log.Println("========================================")
+
 	clientMutex.Lock()
 	defer clientMutex.Unlock()
 
 	if isRunning {
+		log.Println("StartVPN: already running")
 		return C.CString(`{"status":"already_connected"}`)
 	}
 
 	configStr := C.GoString(configJSON)
+	log.Printf("StartVPN: config length=%d", len(configStr))
 
 	var flutterConfig FlutterConfig
 	if err := json.Unmarshal([]byte(configStr), &flutterConfig); err != nil {
+		log.Printf("StartVPN: json parse error: %v", err)
 		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
 	}
 
+	log.Printf("StartVPN: server=%s, modes=%v", flutterConfig.Server, flutterConfig.Modes)
+
 	if flutterConfig.Server == "" {
+		log.Println("StartVPN: server address required")
 		return C.CString(`{"status":"error","message":"server address required"}`)
 	}
 
 	if flutterConfig.SecretKey == "" {
+		log.Println("StartVPN: secret key required")
 		return C.CString(`{"status":"error","message":"secret key required"}`)
 	}
 
@@ -200,6 +201,7 @@ func StartVPN(configJSON *C.char) *C.char {
 			}
 		}
 	}
+	log.Printf("StartVPN: modes=%v", modes)
 
 	if runtime.GOOS == "windows" {
 		exePath, err := os.Executable()
@@ -251,28 +253,34 @@ func StartVPN(configJSON *C.char) *C.char {
 		TUNInterface:           "l7shred",
 	}
 
+	log.Println("StartVPN: creating client...")
 	client := engine.NewClient(clientConfig)
 	if client == nil {
+		log.Println("StartVPN: failed to create client")
 		return C.CString(`{"status":"error","message":"failed to create client"}`)
 	}
 
 	if runtime.GOOS == "windows" {
-		log.Println("Creating TUN device...")
+		log.Println("StartVPN: creating TUN device...")
 		tunDev, err := tun.NewTunDevice()
 		if err != nil {
+			log.Printf("StartVPN: TUN creation error: %v", err)
 			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
 		}
 		tunDevice = tunDev
 		if err := tunDev.SetupIP("10.0.0.2"); err != nil {
+			log.Printf("StartVPN: TUN IP setup error: %v", err)
 			tunDev.Close()
 			tunDevice = nil
 			cleanupResources()
 			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
 		}
-		log.Printf("TUN device created, IP: 10.0.0.2")
+		log.Println("StartVPN: TUN device created, IP: 10.0.0.2")
 	}
 
+	log.Println("StartVPN: starting client...")
 	if err := client.Start(); err != nil {
+		log.Printf("StartVPN: client start error: %v", err)
 		if tunDevice != nil {
 			tunDevice.Close()
 			tunDevice = nil
@@ -282,8 +290,10 @@ func StartVPN(configJSON *C.char) *C.char {
 	}
 
 	timeout := time.Now().Add(10 * time.Second)
+	log.Println("StartVPN: waiting for connection...")
 	for !client.IsConnected() {
 		if time.Now().After(timeout) {
+			log.Println("StartVPN: connection timeout")
 			client.Stop()
 			if tunDevice != nil {
 				tunDevice.Close()
@@ -295,7 +305,7 @@ func StartVPN(configJSON *C.char) *C.char {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	log.Println("Client connected to server")
+	log.Println("StartVPN: client connected to server")
 
 	stopChan = make(chan struct{})
 
@@ -337,6 +347,8 @@ func StartVPN(configJSON *C.char) *C.char {
 	clientInstance = client
 	isRunning = true
 
+	log.Println("StartVPN: SUCCESS")
+	log.Println("========================================")
 	return C.CString(`{"status":"connected"}`)
 }
 
@@ -486,5 +498,6 @@ func WriteTUN(data []byte) {
 }
 
 func main() {
+	log.Println("L7-Shred Go Core started")
 	log.SetOutput(os.Stdout)
 }

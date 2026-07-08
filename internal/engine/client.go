@@ -515,12 +515,24 @@ func (c *Client) readLoop() {
 	log.Println("[Client] readLoop started")
 
 	buf := make([]byte, 65536)
+	keepAliveTicker := time.NewTicker(10 * time.Second)
+	defer keepAliveTicker.Stop()
 
 	for {
 		select {
 		case <-c.stopChan:
 			log.Println("[Client] readLoop: stop signal received, exiting")
 			return
+		case <-keepAliveTicker.C:
+			if c.IsConnected() {
+				conn := c.getConn()
+				if conn != nil {
+					_, err := conn.Write([]byte{0x00})
+					if err != nil {
+						log.Printf("[KeepAlive] Write error: %v", err)
+					}
+				}
+			}
 		default:
 		}
 

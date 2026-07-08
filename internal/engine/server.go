@@ -199,7 +199,7 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 		default:
 		}
 
-		sc.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		sc.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		var data []byte
 		var err error

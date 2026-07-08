@@ -79,6 +79,7 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
+extern __declspec(dllexport) void SetOnPacketCallback(void* callback);
 extern __declspec(dllexport) char* SetTunFileDescriptor(int fd);
 extern __declspec(dllexport) char* StartVPN(char* configJSON);
 extern __declspec(dllexport) char* StopVPN();
