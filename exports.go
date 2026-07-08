@@ -54,7 +54,6 @@ type VPNStatus struct {
 }
 
 func init() {
-	// Настройка логов в файл и консоль одновременно
 	logFile, err := os.OpenFile("vpn.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err == nil {
 		log.SetOutput(logFile)
@@ -93,22 +92,57 @@ func SetOnPacketCallback(callback func([]byte)) {
 
 //export SetTunFileDescriptor
 func SetTunFileDescriptor(fd C.int) *C.char {
+	log.Printf("SetTunFileDescriptor: fd=%d", fd)
+
+	if tunDevice == nil {
+		tunDev, err := tun.NewTunDevice()
+		if err != nil {
+			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+		}
+		tunDevice = tunDev
+	}
+
+	if err := tunDevice.SetFD(int(fd)); err != nil {
+		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+	}
+
+	log.Printf("SetTunFileDescriptor: FD set successfully")
+
+	// На Android запускаем TUN reader ПОСЛЕ того как FD установлен
+	if runtime.GOOS == "android" {
+		go startAndroidTunReader()
+	}
+
 	return C.CString(`{"status":"ok"}`)
 }
 
 func startAndroidTunReader() {
-	if tunDevice == nil || clientInstance == nil || !clientInstance.IsConnected() {
-		log.Println("Android TUN reader: not ready")
+	log.Println("Android TUN reader: started")
+
+	// Ждём пока клиент подключится
+	for i := 0; i < 30; i++ {
+		if clientInstance != nil && clientInstance.IsConnected() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if clientInstance == nil || !clientInstance.IsConnected() {
+		log.Println("Android TUN reader: client not connected")
 		return
 	}
 
-	log.Println("Android TUN reader: started")
 	for {
 		select {
 		case <-stopChan:
 			log.Println("Android TUN reader: stop signal received")
 			return
 		default:
+		}
+
+		if tunDevice == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
 		data, err := tunDevice.Read()
@@ -498,6 +532,5 @@ func WriteTUN(data []byte) {
 }
 
 func main() {
-	log.Println("L7-Shred Go Core started")
 	log.SetOutput(os.Stdout)
 }
