@@ -19,6 +19,11 @@ type TunDevice struct {
 }
 
 func NewTunDevice() (*TunDevice, error) {
+	// Сначала удаляем старый адаптер (если есть)
+	oldAdapter := exec.Command("wintun", "delete", "l7shred")
+	oldAdapter.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	oldAdapter.Run()
+
 	tunDev, err := tun.CreateTUN("l7shred", 1400)
 	if err != nil {
 		return nil, err
@@ -66,6 +71,12 @@ func (t *TunDevice) Close() error {
 }
 
 func (t *TunDevice) SetupIP(ip string) error {
+	// Сначала удаляем старый IP (если есть)
+	delCmd := exec.Command("netsh", "interface", "ip", "delete", "address",
+		t.name, ip)
+	delCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	delCmd.Run()
+
 	cmd := exec.Command("netsh", "interface", "ip", "set", "address",
 		t.name, "static", ip, "255.255.255.0", "gateway=none")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}

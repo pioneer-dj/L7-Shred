@@ -300,10 +300,17 @@ func (c *Client) setupWindowsRouting() error {
 
 	c.getTUNInterfaceIndex()
 
+	// Удаляем старый default маршрут через TUN
 	cmd := exec.Command("cmd", "/c", "route delete 0.0.0.0")
 	hideWindow(cmd)
 	cmd.Run()
 
+	// Удаляем старый маршрут к серверу (если есть)
+	delCmd := exec.Command("cmd", "/c", "route delete "+c.serverIP)
+	hideWindow(delCmd)
+	delCmd.Run()
+
+	// Добавляем маршрут к серверу через реальный шлюз
 	routeCmd := fmt.Sprintf("route add %s mask 255.255.255.255 %s metric 1", c.serverIP, c.defaultGateway)
 	cmd = exec.Command("cmd", "/c", routeCmd)
 	hideWindow(cmd)
@@ -311,6 +318,7 @@ func (c *Client) setupWindowsRouting() error {
 		log.Printf("[Windows] Failed to add server route: %v", err)
 	}
 
+	// Добавляем default маршрут через TUN
 	var defaultRouteCmd string
 	if c.tunIndex > 0 {
 		defaultRouteCmd = fmt.Sprintf("route add 0.0.0.0 mask 0.0.0.0 10.0.0.1 metric 1 IF %d", c.tunIndex)
@@ -326,6 +334,7 @@ func (c *Client) setupWindowsRouting() error {
 		log.Printf("[Windows] Default route added via TUN (metric 1)")
 	}
 
+	// Запускаем добавление Russian subnet routes в фоне
 	if c.splitTunnel {
 		c.addRussianSubnetRoutes()
 	}
@@ -334,17 +343,23 @@ func (c *Client) setupWindowsRouting() error {
 }
 
 func (c *Client) addRussianSubnetRoutes() {
-	log.Printf("[Windows] Adding Russian subnet routes...")
+	log.Printf("[Windows] Adding Russian subnet routes in background...")
 
-	added := 0
-	for _, subnet := range tun.RussianSubnets {
-		cmd := exec.Command("cmd", "/c", "route add", subnet, c.defaultGateway, "metric", "1000")
-		hideWindow(cmd)
-		if err := cmd.Run(); err == nil {
-			added++
+	go func() {
+		added := 0
+		start := time.Now()
+		for i, subnet := range tun.RussianSubnets {
+			cmd := exec.Command("cmd", "/c", "route add", subnet, c.defaultGateway, "metric", "1000")
+			hideWindow(cmd)
+			if err := cmd.Run(); err == nil {
+				added++
+			}
+			if i%100 == 0 && i > 0 {
+				log.Printf("[Windows] Added %d/%d Russian subnet routes", added, len(tun.RussianSubnets))
+			}
 		}
-	}
-	log.Printf("[Windows] Added %d Russian subnet routes", added)
+		log.Printf("[Windows] Added %d Russian subnet routes in %v", added, time.Since(start))
+	}()
 }
 
 func (c *Client) setupLinuxRouting() error {
