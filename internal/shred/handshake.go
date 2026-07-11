@@ -266,6 +266,13 @@ func (hs *HandshakeState) MarkSeen(sequence uint64) {
 	}
 }
 
+func (hs *HandshakeState) Reset() {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	hs.LastSeen = make(map[uint64]time.Time)
+	hs.Sequence = 0
+}
+
 type HandshakeManager struct {
 	state   *HandshakeState
 	authKey []byte
@@ -285,19 +292,27 @@ func NewHandshakeManager(authKey []byte, timeout time.Duration) *HandshakeManage
 	}
 }
 
-func (hm *HandshakeManager) PerformClientHandshake(conn net.Conn, interval time.Duration, modes []ProtocolMode, currentMode ProtocolMode) error {
+func (hm *HandshakeManager) ResetReplayState() {
+	hm.state.Reset()
+	log.Printf("[Handshake] Replay state reset")
+}
+
+func (hm *HandshakeManager) Sign(data []byte) []byte {
+	h := hmac.New(sha256.New, hm.authKey)
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+func (hm *HandshakeManager) PerformClientHandshake(conn net.Conn, interval time.Duration, modes []ProtocolMode, currentMode ProtocolMode, sequence uint64) error {
 	log.Printf("[Handshake] ========== CLIENT HANDSHAKE START ==========")
 	log.Printf("[Handshake] Connection: local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
-	log.Printf("[Handshake] Interval: %v, Modes: %v, CurrentMode: %v", interval, modes, currentMode)
+	log.Printf("[Handshake] Interval: %v, Modes: %v, CurrentMode: %v, Sequence: %d", interval, modes, currentMode, sequence)
 
-	seq := hm.state.NextSequence()
-	log.Printf("[Handshake] Using sequence: %d", seq)
-
-	syn := NewHandshake(HandshakeSyn, interval, modes, currentMode, seq)
+	syn := NewHandshake(HandshakeSyn, interval, modes, currentMode, sequence)
 	synData := syn.Encode()
 	log.Printf("[Handshake] SynData length: %d", len(synData))
 
-	signature := hm.sign(synData)
+	signature := hm.Sign(synData)
 	log.Printf("[Handshake] Signature length: %d", len(signature))
 
 	packet := append(synData, signature...)
@@ -420,7 +435,7 @@ func (hm *HandshakeManager) PerformServerHandshake(conn net.Conn) (*SessionConfi
 	seq := hm.state.NextSequence()
 	ack := NewHandshake(HandshakeAck, config.SwitchInterval, config.Modes, config.CurrentMode, seq)
 	ackData := ack.Encode()
-	ackSignature := hm.sign(ackData)
+	ackSignature := hm.Sign(ackData)
 
 	log.Printf("[Handshake] Sending ACK, sequence=%d, length=%d", seq, len(ackData)+len(ackSignature))
 
@@ -449,14 +464,8 @@ func min(a, b int) int {
 	return b
 }
 
-func (hm *HandshakeManager) sign(data []byte) []byte {
-	h := hmac.New(sha256.New, hm.authKey)
-	h.Write(data)
-	return h.Sum(nil)
-}
-
 func (hm *HandshakeManager) verify(data, signature []byte) bool {
-	expected := hm.sign(data)
+	expected := hm.Sign(data)
 	return hmac.Equal(expected, signature)
 }
 

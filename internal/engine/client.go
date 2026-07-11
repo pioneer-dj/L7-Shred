@@ -235,6 +235,8 @@ func (c *Client) Start() error {
 		}
 	}
 
+	c.handshakeMgr.ResetReplayState()
+
 	if err := c.performHandshake(); err != nil {
 		log.Printf("[Client] performHandshake error: %v", err)
 		c.outbound.Close()
@@ -300,17 +302,14 @@ func (c *Client) setupWindowsRouting() error {
 
 	c.getTUNInterfaceIndex()
 
-	// Удаляем старый default маршрут через TUN
 	cmd := exec.Command("cmd", "/c", "route delete 0.0.0.0")
 	hideWindow(cmd)
 	cmd.Run()
 
-	// Удаляем старый маршрут к серверу (если есть)
 	delCmd := exec.Command("cmd", "/c", "route delete "+c.serverIP)
 	hideWindow(delCmd)
 	delCmd.Run()
 
-	// Добавляем маршрут к серверу через реальный шлюз
 	routeCmd := fmt.Sprintf("route add %s mask 255.255.255.255 %s metric 1", c.serverIP, c.defaultGateway)
 	cmd = exec.Command("cmd", "/c", routeCmd)
 	hideWindow(cmd)
@@ -318,7 +317,6 @@ func (c *Client) setupWindowsRouting() error {
 		log.Printf("[Windows] Failed to add server route: %v", err)
 	}
 
-	// Добавляем default маршрут через TUN
 	var defaultRouteCmd string
 	if c.tunIndex > 0 {
 		defaultRouteCmd = fmt.Sprintf("route add 0.0.0.0 mask 0.0.0.0 10.0.0.1 metric 1 IF %d", c.tunIndex)
@@ -334,7 +332,6 @@ func (c *Client) setupWindowsRouting() error {
 		log.Printf("[Windows] Default route added via TUN (metric 1)")
 	}
 
-	// Запускаем добавление Russian subnet routes в фоне
 	if c.splitTunnel {
 		c.addRussianSubnetRoutes()
 	}
@@ -444,11 +441,14 @@ func (c *Client) performHandshake() error {
 
 	log.Printf("[Client] Got connection, local=%s, remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 
+	sequence := uint64(time.Now().UnixNano()) ^ c.session.ID
+
 	err := c.handshakeMgr.PerformClientHandshake(
 		conn,
 		c.mixer.GetSwitchInterval(),
 		c.mixer.GetModes(),
 		c.mixer.GetCurrentMode(),
+		sequence,
 	)
 
 	if err != nil {
@@ -478,6 +478,18 @@ func (c *Client) GetConn() net.Conn {
 		return nil
 	}
 	return c.outbound.Conn()
+}
+
+func (c *Client) GetSession() *shred.Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.session
+}
+
+func (c *Client) GetAuthKey() []byte {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.authKey
 }
 
 func (c *Client) reconnect() error {
@@ -511,6 +523,8 @@ func (c *Client) reconnect() error {
 			udpConn.SetWriteBuffer(4 * 1024 * 1024)
 		}
 	}
+
+	c.handshakeMgr.ResetReplayState()
 
 	if err := c.performHandshake(); err != nil {
 		return err
@@ -860,10 +874,6 @@ func (c *Client) GetStats() map[string]interface{} {
 	return stats
 }
 
-func (c *Client) GetSession() *shred.Session {
-	return c.session
-}
-
 func (c *Client) SetOnPacket(callback func([]byte)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -881,10 +891,6 @@ func (c *Client) SetSwitchInterval(interval time.Duration) {
 	c.mixer.SetSwitchInterval(interval)
 	c.session.MaskConfig.SwitchInterval = interval
 	c.session.SyncModes()
-}
-
-func (c *Client) GetAuthKey() []byte {
-	return c.authKey
 }
 
 func (c *Client) SetTunAdded(added bool) {

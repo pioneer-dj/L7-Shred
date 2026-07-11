@@ -227,6 +227,16 @@ func (s *Server) handleDataExchange(sc *ServerConnection) {
 			continue
 		}
 
+		if len(data) >= 5 && data[0] == 0xDE && data[1] == 0xAD &&
+			data[2] == 0xBE && data[3] == 0xEF {
+			handshakeType := data[4]
+			if handshakeType == 0x03 {
+				s.logger.Printf("Received FIN from session %d, closing gracefully", sc.ID)
+				sc.Conn.Close()
+				return
+			}
+		}
+
 		sc.mu.Lock()
 		sc.BytesIn += uint64(len(data))
 		sc.LastSeen = time.Now()

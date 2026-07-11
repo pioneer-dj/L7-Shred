@@ -108,7 +108,6 @@ func SetTunFileDescriptor(fd C.int) *C.char {
 
 	log.Printf("SetTunFileDescriptor: FD set successfully")
 
-	// На Android запускаем TUN reader ПОСЛЕ того как FD установлен
 	if runtime.GOOS == "android" {
 		go startAndroidTunReader()
 	}
@@ -119,7 +118,6 @@ func SetTunFileDescriptor(fd C.int) *C.char {
 func startAndroidTunReader() {
 	log.Println("Android TUN reader: started")
 
-	// Ждём пока клиент подключится
 	for i := 0; i < 30; i++ {
 		if clientInstance != nil && clientInstance.IsConnected() {
 			break
@@ -399,6 +397,40 @@ func StopVPN() *C.char {
 	}
 
 	log.Println("StopVPN: stopping VPN...")
+
+	if clientInstance != nil && clientInstance.IsConnected() {
+		log.Println("StopVPN: sending FIN handshake to server...")
+		conn := clientInstance.GetConn()
+		if conn != nil {
+			session := clientInstance.GetSession()
+			if session != nil {
+				fin := shred.NewHandshake(
+					shred.HandshakeFin,
+					session.MaskConfig.SwitchInterval,
+					session.MaskConfig.Modes,
+					session.MaskConfig.CurrentMode,
+					uint64(session.LocalMixer.GetCurrentMode()),
+				)
+				finData := fin.Encode()
+
+				authKey := clientInstance.GetAuthKey()
+				if len(authKey) > 0 {
+					handshakeMgr := shred.NewHandshakeManager(authKey, 5*time.Second)
+					signature := handshakeMgr.Sign(finData)
+					packet := append(finData, signature...)
+
+					for i := 0; i < 3; i++ {
+						if _, err := conn.Write(packet); err != nil {
+							log.Printf("StopVPN: FIN write error (attempt %d): %v", i+1, err)
+						} else {
+							log.Printf("StopVPN: FIN sent (attempt %d)", i+1)
+						}
+						time.Sleep(50 * time.Millisecond)
+					}
+				}
+			}
+		}
+	}
 
 	if stopChan != nil {
 		log.Println("StopVPN: closing stopChan")
