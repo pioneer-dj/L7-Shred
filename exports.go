@@ -23,6 +23,7 @@ var (
 	clientInstance   *engine.Client
 	clientMutex      sync.Mutex
 	isRunning        bool
+	isStopping       bool
 	stopChan         chan struct{}
 	currentServerIP  string
 	lastStats        map[string]interface{}
@@ -169,6 +170,17 @@ func StartVPN(configJSON *C.char) *C.char {
 	if isRunning {
 		log.Println("StartVPN: already running")
 		return C.CString(`{"status":"already_connected"}`)
+	}
+
+	if isStopping {
+		log.Println("StartVPN: stopping in progress, wait...")
+		clientMutex.Unlock()
+		time.Sleep(500 * time.Millisecond)
+		clientMutex.Lock()
+		if isStopping {
+			log.Println("StartVPN: stop still in progress")
+			return C.CString(`{"status":"error","message":"stop in progress"}`)
+		}
 	}
 
 	configStr := C.GoString(configJSON)
@@ -389,12 +401,21 @@ func StopVPN() *C.char {
 	log.Println("StopVPN: called")
 
 	clientMutex.Lock()
-	defer clientMutex.Unlock()
 
 	if !isRunning {
+		clientMutex.Unlock()
 		log.Println("StopVPN: already stopped")
 		return C.CString(`{"status":"disconnected"}`)
 	}
+
+	if isStopping {
+		clientMutex.Unlock()
+		log.Println("StopVPN: already stopping")
+		return C.CString(`{"status":"disconnected"}`)
+	}
+
+	isStopping = true
+	clientMutex.Unlock()
 
 	log.Println("StopVPN: stopping VPN...")
 
@@ -457,7 +478,11 @@ func StopVPN() *C.char {
 		clientInstance = nil
 	}
 
+	clientMutex.Lock()
+	isStopping = false
 	isRunning = false
+	clientMutex.Unlock()
+
 	log.Println("StopVPN: VPN stopped successfully")
 
 	return C.CString(`{"status":"disconnected"}`)
