@@ -103,14 +103,14 @@ func SetTunFileDescriptor(fd C.int) *C.char {
 		tunDevice = tunDev
 	}
 
-	if err := tunDevice.SetFD(int(fd)); err != nil {
-		return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
-	}
-
-	log.Printf("SetTunFileDescriptor: FD set successfully")
-
 	if runtime.GOOS == "android" {
+		if err := tunDevice.SetFD(int(fd)); err != nil {
+			return C.CString(`{"status":"error","message":"` + err.Error() + `"}`)
+		}
+		log.Printf("SetTunFileDescriptor: FD set successfully")
 		go startAndroidTunReader()
+	} else {
+		log.Printf("SetTunFileDescriptor: SetFD not needed on %s", runtime.GOOS)
 	}
 
 	return C.CString(`{"status":"ok"}`)
@@ -390,6 +390,7 @@ func StartVPN(configJSON *C.char) *C.char {
 
 	clientInstance = client
 	isRunning = true
+	isStopping = false
 
 	log.Println("StartVPN: SUCCESS")
 	log.Println("========================================")
@@ -401,9 +402,9 @@ func StopVPN() *C.char {
 	log.Println("StopVPN: called")
 
 	clientMutex.Lock()
+	defer clientMutex.Unlock()
 
 	if !isRunning {
-		clientMutex.Unlock()
 		log.Println("StopVPN: already stopped")
 		return C.CString(`{"status":"disconnected"}`)
 	}
@@ -415,8 +416,6 @@ func StopVPN() *C.char {
 	}
 
 	isStopping = true
-	clientMutex.Unlock()
-
 	log.Println("StopVPN: stopping VPN...")
 
 	if clientInstance != nil && clientInstance.IsConnected() {
@@ -433,13 +432,11 @@ func StopVPN() *C.char {
 					uint64(session.LocalMixer.GetCurrentMode()),
 				)
 				finData := fin.Encode()
-
 				authKey := clientInstance.GetAuthKey()
 				if len(authKey) > 0 {
 					handshakeMgr := shred.NewHandshakeManager(authKey, 5*time.Second)
 					signature := handshakeMgr.Sign(finData)
 					packet := append(finData, signature...)
-
 					for i := 0; i < 3; i++ {
 						if _, err := conn.Write(packet); err != nil {
 							log.Printf("StopVPN: FIN write error (attempt %d): %v", i+1, err)
@@ -478,13 +475,14 @@ func StopVPN() *C.char {
 		clientInstance = nil
 	}
 
-	clientMutex.Lock()
-	isStopping = false
+	// ПРИНУДИТЕЛЬНЫЙ СБРОС
 	isRunning = false
-	clientMutex.Unlock()
+	isStopping = false
+	currentServerIP = ""
+	lastStats = nil
+	onPacketCallback = nil
 
 	log.Println("StopVPN: VPN stopped successfully")
-
 	return C.CString(`{"status":"disconnected"}`)
 }
 

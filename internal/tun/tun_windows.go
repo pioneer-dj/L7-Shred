@@ -90,3 +90,8 @@ func (t *TunDevice) SetupIP(ip string) error {
 func (t *TunDevice) Name() string {
 	return t.name
 }
+
+// SetFD - заглушка для Windows (не используется, но нужна для совместимости)
+func (t *TunDevice) SetFD(fd int) error {
+	return nil
+}
