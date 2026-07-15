@@ -13,6 +13,7 @@ import (
 	"github.com/l7-shred/core/internal/auth"
 	"github.com/l7-shred/core/internal/database"
 	"github.com/l7-shred/core/internal/engine"
+	"github.com/l7-shred/core/internal/payment"
 	"github.com/l7-shred/core/internal/transport"
 )
 
@@ -37,11 +38,15 @@ func main() {
 		Host:     "localhost",
 		Port:     "5432",
 		User:     "l7shred_user",
-		Password: "secure_password_here",
+		Password: "auifgeuhoa_38phg",
 		DBName:   "l7shred",
 		SSLMode:  "disable",
 	}); err != nil {
 		log.Fatalf("Failed to init database: %v", err)
+	}
+
+	if err := database.AutoMigrate(database.GetDB()); err != nil {
+		log.Fatalf("Failed to migrate database: %v", err)
 	}
 
 	auth.InitJWT("your-super-secret-jwt-key-change-me-in-production")
@@ -56,6 +61,11 @@ func main() {
 	}
 
 	router := api.SetupRoutes()
+
+	// Payment routes
+	router.HandleFunc("/api/payment/create-invoice", payment.CreateInvoiceHandler).Methods("POST")
+	router.HandleFunc("/api/payment/webhook", payment.HandleWebhook).Methods("POST")
+	router.HandleFunc("/api/payment/status", payment.GetSubscriptionStatus).Methods("GET")
 
 	go func() {
 		log.Printf("API server listening on :8444")

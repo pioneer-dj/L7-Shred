@@ -9,7 +9,7 @@ import (
 
 type User struct {
 	ID             uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	Email          string     `gorm:"type:varchar(255);uniqueIndex;not null"`
+	Email          string     `gorm:"type:varchar(255);unique;not null"`
 	PasswordHash   string     `gorm:"type:varchar(255);not null"`
 	Name           string     `gorm:"type:varchar(255);default:''"`
 	CreatedAt      time.Time  `gorm:"autoCreateTime"`
@@ -47,7 +47,7 @@ func (Session) TableName() string {
 type EmailVerification struct {
 	ID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	UserID    uuid.UUID `gorm:"type:uuid;not null"`
-	Token     string    `gorm:"type:varchar(255);uniqueIndex;not null"`
+	Token     string    `gorm:"type:varchar(255);unique;not null"`
 	ExpiresAt time.Time `gorm:"type:timestamptz;not null"`
 	CreatedAt time.Time `gorm:"autoCreateTime"`
 
@@ -59,11 +59,11 @@ func (EmailVerification) TableName() string {
 }
 
 type PasswordReset struct {
-	ID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	UserID    uuid.UUID `gorm:"type:uuid;not null"`
-	Token     string    `gorm:"type:varchar(255);uniqueIndex;not null"`
-	ExpiresAt time.Time `gorm:"type:timestamptz;not null"`
-	CreatedAt time.Time `gorm:"autoCreateTime"`
+	ID        uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	UserID    uuid.UUID  `gorm:"type:uuid;not null"`
+	Token     string     `gorm:"type:varchar(255);unique;not null"`
+	ExpiresAt time.Time  `gorm:"type:timestamptz;not null"`
+	CreatedAt time.Time  `gorm:"autoCreateTime"`
 	UsedAt    *time.Time `gorm:"type:timestamptz"`
 
 	User User `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE"`
@@ -73,6 +73,23 @@ func (PasswordReset) TableName() string {
 	return "password_resets"
 }
 
+type Subscription struct {
+	ID                   string    `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	UserID               string    `gorm:"type:uuid;not null;index"`
+	LavaSubscriptionID   string    `gorm:"type:varchar(255);not null;index"`
+	ProductID            string    `gorm:"type:varchar(255);not null"`
+	Status               string    `gorm:"type:varchar(50);not null;default:'pending'"`
+	ExpiresAt            time.Time `gorm:"not null"`
+	CreatedAt            time.Time `gorm:"autoCreateTime"`
+	UpdatedAt            time.Time `gorm:"autoUpdateTime"`
+
+	User User `gorm:"foreignKey:UserID"`
+}
+
+func (Subscription) TableName() string {
+	return "subscriptions"
+}
+
 func AutoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(&User{}, &Session{}, &EmailVerification{}, &PasswordReset{})
+	return db.AutoMigrate(&User{}, &Session{}, &EmailVerification{}, &PasswordReset{}, &Subscription{})
 }
