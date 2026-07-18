@@ -12,6 +12,7 @@ func SetupRoutes() *mux.Router {
 	api := r.PathPrefix("/api").Subrouter()
 
 	api.HandleFunc("/register", RegisterHandler).Methods(http.MethodPost)
+	api.HandleFunc("/verify-code", VerifyCodeHandler).Methods(http.MethodPost)
 	api.HandleFunc("/login", LoginHandler).Methods(http.MethodPost)
 	api.HandleFunc("/refresh", RefreshHandler).Methods(http.MethodPost)
 	api.HandleFunc("/logout", LogoutHandler).Methods(http.MethodPost)

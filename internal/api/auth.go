@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/l7-shred/core/internal/auth"
 	"github.com/l7-shred/core/internal/database"
+	"github.com/l7-shred/core/internal/email"
 	"gorm.io/gorm"
 )
 
@@ -15,6 +16,11 @@ type RegisterRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 	Name     string `json:"name"`
+}
+
+type VerifyCodeRequest struct {
+	Email string `json:"email"`
+	Code  string `json:"code"`
 }
 
 type LoginRequest struct {
@@ -54,6 +60,17 @@ type UserResponse struct {
 	CreatedAt      time.Time  `json:"created_at"`
 }
 
+type VerifyCodeResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+}
+
+var smtpClient *email.SMTPClient
+
+func InitSMTP(config email.SMTPConfig) {
+	smtpClient = email.NewSMTPClient(config)
+}
+
 func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -73,8 +90,24 @@ func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 
 	var existingUser database.User
 	if err := database.DB.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
-		sendJSONError(w, "user already exists", http.StatusConflict)
-		return
+		if existingUser.EmailVerified {
+			sendJSONError(w, "user already exists", http.StatusConflict)
+			return
+		}
+		if existingUser.VerificationCodeExpires != nil && time.Now().Before(*existingUser.VerificationCodeExpires) {
+			if smtpClient != nil {
+				email.SendVerificationCodeWithHTML(smtpClient, req.Email, existingUser.VerificationCode)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":               true,
+				"message":               "Verification code resent",
+				"requires_verification": true,
+				"email":                 req.Email,
+			})
+			return
+		}
 	}
 
 	hashedPassword, err := auth.HashPassword(req.Password)
@@ -83,26 +116,109 @@ func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
-	trialEndsAt := now.Add(7 * 24 * time.Hour)
+	verificationCode := email.GenerateVerificationCode()
+	expiresAt := time.Now().Add(10 * time.Minute)
 
 	name := req.Name
 	if name == "" {
 		name = req.Email
 	}
 
-	user := database.User{
-		Email:          req.Email,
-		PasswordHash:   hashedPassword,
-		Name:           name,
-		EmailVerified:  true,
-		TrialStartedAt: &now,
-		TrialEndsAt:    &trialEndsAt,
-		Status:         "active",
+	var user database.User
+
+	if existingUser.ID != uuid.Nil && !existingUser.EmailVerified {
+		user = existingUser
+		user.PasswordHash = hashedPassword
+		user.Name = name
+		user.VerificationCode = verificationCode
+		user.VerificationCodeExpires = &expiresAt
+		if err := database.DB.Save(&user).Error; err != nil {
+			sendJSONError(w, "failed to update user", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		user = database.User{
+			Email:                   req.Email,
+			PasswordHash:            hashedPassword,
+			Name:                    name,
+			EmailVerified:           false,
+			Status:                  "pending_verification",
+			VerificationCode:        verificationCode,
+			VerificationCodeExpires: &expiresAt,
+		}
+		if err := database.DB.Create(&user).Error; err != nil {
+			sendJSONError(w, "failed to create user", http.StatusInternalServerError)
+			return
+		}
 	}
 
-	if err := database.DB.Create(&user).Error; err != nil {
-		sendJSONError(w, "failed to create user", http.StatusInternalServerError)
+	if smtpClient != nil {
+		if err := email.SendVerificationCodeWithHTML(smtpClient, req.Email, verificationCode); err != nil {
+			database.DB.Delete(&user)
+			sendJSONError(w, "failed to send verification email", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		database.DB.Delete(&user)
+		sendJSONError(w, "email service not configured", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":               true,
+		"message":               "Verification code sent to email",
+		"requires_verification": true,
+		"email":                 req.Email,
+	})
+}
+
+func VerifyCodeHandler(w http.ResponseWriter, r *http.Request) {
+	var req VerifyCodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendJSONError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Email == "" || req.Code == "" {
+		sendJSONError(w, "email and code are required", http.StatusBadRequest)
+		return
+	}
+
+	var user database.User
+	if err := database.DB.Where("email = ?", req.Email).First(&user).Error; err != nil {
+		sendJSONError(w, "user not found", http.StatusNotFound)
+		return
+	}
+
+	if user.EmailVerified {
+		sendJSONError(w, "email already verified", http.StatusBadRequest)
+		return
+	}
+
+	if user.VerificationCodeExpires == nil || time.Now().After(*user.VerificationCodeExpires) {
+		sendJSONError(w, "verification code expired", http.StatusBadRequest)
+		return
+	}
+
+	if user.VerificationCode != req.Code {
+		sendJSONError(w, "invalid verification code", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now()
+	trialEndsAt := now.Add(7 * 24 * time.Hour)
+
+	user.EmailVerified = true
+	user.Status = "active"
+	user.TrialStartedAt = &now
+	user.TrialEndsAt = &trialEndsAt
+	user.VerificationCode = ""
+	user.VerificationCodeExpires = nil
+
+	if err := database.DB.Save(&user).Error; err != nil {
+		sendJSONError(w, "failed to verify email", http.StatusInternalServerError)
 		return
 	}
 
@@ -132,7 +248,7 @@ func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(AuthResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
@@ -161,6 +277,11 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sendJSONError(w, "database error", http.StatusInternalServerError)
+		return
+	}
+
+	if !user.EmailVerified {
+		sendJSONError(w, "please verify your email first", http.StatusForbidden)
 		return
 	}
 

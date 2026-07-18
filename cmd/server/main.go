@@ -12,6 +12,7 @@ import (
 	"github.com/l7-shred/core/internal/api"
 	"github.com/l7-shred/core/internal/auth"
 	"github.com/l7-shred/core/internal/database"
+	"github.com/l7-shred/core/internal/email"
 	"github.com/l7-shred/core/internal/engine"
 	"github.com/l7-shred/core/internal/payment"
 	"github.com/l7-shred/core/internal/transport"
@@ -23,7 +24,7 @@ var (
 )
 
 func main() {
-	configPath := flag.String("config", "configs/server.standalone.json", "config file path")
+	configPath := flag.String("config", "configs/server.kcp.json", "config file path")
 	version := flag.Bool("version", false, "show version")
 	flag.Parse()
 
@@ -51,6 +52,14 @@ func main() {
 
 	auth.InitJWT("your-super-secret-jwt-key-change-me-in-production")
 
+	api.InitSMTP(email.SMTPConfig{
+		Host:     "smtp.ethereal.email",
+		Port:     "587",
+		Username: "isaac43@ethereal.email",
+		Password: "Dj89V8xTZg8TE1UZ5y",
+		From:     "isaac43@ethereal.email",
+	})
+
 	cfg, err := transport.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -62,7 +71,6 @@ func main() {
 
 	router := api.SetupRoutes()
 
-	// Payment routes
 	router.HandleFunc("/api/payment/create-invoice", payment.CreateInvoiceHandler).Methods("POST")
 	router.HandleFunc("/api/payment/webhook", payment.HandleWebhook).Methods("POST")
 	router.HandleFunc("/api/payment/status", payment.GetSubscriptionStatus).Methods("GET")

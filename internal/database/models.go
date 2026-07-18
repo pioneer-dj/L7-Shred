@@ -17,7 +17,9 @@ type User struct {
 	EmailVerified  bool       `gorm:"default:false"`
 	TrialStartedAt *time.Time `gorm:"type:timestamptz"`
 	TrialEndsAt    *time.Time `gorm:"type:timestamptz"`
-	Status         string     `gorm:"type:varchar(50);default:'pending_email'"`
+	Status         string     `gorm:"type:varchar(50);default:'pending_verification'"`
+	VerificationCode        string     `gorm:"type:varchar(10)"`
+	VerificationCodeExpires *time.Time `gorm:"type:timestamptz"`
 
 	Sessions          []Session          `gorm:"foreignKey:UserID"`
 	EmailVerification []EmailVerification `gorm:"foreignKey:UserID"`
