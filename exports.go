@@ -131,6 +131,8 @@ func startAndroidTunReader() {
 		return
 	}
 
+	log.Println("Android TUN reader: client connected, starting read loop")
+
 	for {
 		select {
 		case <-stopChan:
@@ -147,13 +149,18 @@ func startAndroidTunReader() {
 		data, err := tunDevice.Read()
 		if err != nil {
 			log.Printf("Android TUN read error: %v", err)
-			return
-		}
-		if len(data) == 0 {
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+		if len(data) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		log.Printf("Android TUN read: %d bytes", len(data))
 		if clientInstance.IsConnected() {
-			clientInstance.Send(data)
+			if err := clientInstance.Send(data); err != nil {
+				log.Printf("Android TUN send error: %v", err)
+			}
 		}
 	}
 }
@@ -205,7 +212,7 @@ func StartVPN(configJSON *C.char) *C.char {
 	}
 
 	if flutterConfig.MTU == 0 {
-		flutterConfig.MTU = 1200
+		flutterConfig.MTU = 1350
 	}
 
 	if flutterConfig.Cipher == "" {
@@ -371,6 +378,7 @@ func StartVPN(configJSON *C.char) *C.char {
 					return
 				}
 				if len(data) == 0 {
+					time.Sleep(10 * time.Millisecond)
 					continue
 				}
 				if client.IsConnected() {
@@ -475,7 +483,6 @@ func StopVPN() *C.char {
 		clientInstance = nil
 	}
 
-	// ПРИНУДИТЕЛЬНЫЙ СБРОС
 	isRunning = false
 	isStopping = false
 	currentServerIP = ""

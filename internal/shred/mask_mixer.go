@@ -25,6 +25,7 @@ const (
 	ModeSberID
 	ModeGosuslugi
 	ModeTLS
+	ModeBrowser
 )
 
 func (m ProtocolMode) String() string {
@@ -59,6 +60,8 @@ func (m ProtocolMode) String() string {
 		return "gosuslugi"
 	case ModeTLS:
 		return "tls"
+	case ModeBrowser:
+		return "browser"
 	default:
 		return "unknown"
 	}
@@ -102,6 +105,8 @@ func (f *MaskFactory) CreateMask(mode ProtocolMode) masks.Masker {
 		return masks.NewGosuslugiMask()
 	case ModeTLS:
 		return masks.NewTLSMask()
+	case ModeBrowser:
+		return masks.NewBrowserMask()
 	default:
 		return masks.NewVKMask()
 	}
@@ -192,6 +197,13 @@ func (m *MaskMixer) lock() {
 
 func (m *MaskMixer) unlock() {
 	<-m.mu
+}
+
+func (m *MaskMixer) SelectMask(payload []byte) ProtocolMode {
+	if len(payload) >= 5 && payload[0] == 0x16 && payload[1] == 0x03 {
+		return ModeBrowser
+	}
+	return m.GetCurrentMode()
 }
 
 func (m *MaskMixer) checkTimeBasedRotation() {
@@ -335,11 +347,12 @@ func (m *MaskMixer) rotate() {
 }
 
 func (m *MaskMixer) Wrap(payload []byte) []byte {
-	mask := m.GetCurrentMask()
+	mode := m.SelectMask(payload)
+	mask := m.factory.CreateMask(mode)
 
 	m.lock()
 	m.packetsWrapped++
-	m.stats[m.currentMode]++
+	m.stats[mode]++
 	m.unlock()
 
 	return mask.Wrap(payload)
