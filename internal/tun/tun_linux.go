@@ -27,7 +27,7 @@ func NewTunDevice() (*TunDevice, error) {
 		flags uint16
 		_     [22]byte
 	}{}
-	copy(ifr.name[:], "tun0")
+	copy(ifr.name[:], "obelisk0")
 	ifr.flags = 0x0001 | 0x1000
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x400454ca, uintptr(unsafe.Pointer(&ifr)))

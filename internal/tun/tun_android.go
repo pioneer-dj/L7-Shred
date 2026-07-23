@@ -31,7 +31,7 @@ type TunDevice struct {
 
 func NewTunDevice() (*TunDevice, error) {
 	return &TunDevice{
-		name: "tun0",
+		name: "obelisk0",
 	}, nil
 }
 
@@ -39,7 +39,7 @@ func (t *TunDevice) SetFD(fd int) error {
 	if fd < 0 {
 		return os.ErrInvalid
 	}
-	t.fd = os.NewFile(uintptr(fd), "tun0")
+	t.fd = os.NewFile(uintptr(fd), "obelisk0")
 	log.Printf("Android TUN: FD set to %d", fd)
 	return nil
 }

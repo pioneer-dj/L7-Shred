@@ -8,5 +8,4 @@ import (
 )
 
 func hideWindow(cmd *exec.Cmd) {
-	// На не-Windows платформах ничего не делаем
 }

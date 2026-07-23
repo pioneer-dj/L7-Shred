@@ -20,11 +20,11 @@ type TunDevice struct {
 
 func NewTunDevice() (*TunDevice, error) {
 	// Сначала удаляем старый адаптер (если есть)
-	oldAdapter := exec.Command("wintun", "delete", "l7shred")
+	oldAdapter := exec.Command("wintun", "delete", "obelisk0")
 	oldAdapter.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	oldAdapter.Run()
 
-	tunDev, err := tun.CreateTUN("l7shred", 1400)
+	tunDev, err := tun.CreateTUN("obelisk0", 1400)
 	if err != nil {
 		return nil, err
 	}
