@@ -11,5 +11,4 @@ var (
 	ErrInvalidConfig      = errors.New("invalid configuration")
 	ErrHandshakeFailed    = errors.New("handshake failed")
 	ErrSessionNotFound    = errors.New("session not found")
-	ErrUnsupportedProxy   = errors.New("unsupported proxy type")
 )

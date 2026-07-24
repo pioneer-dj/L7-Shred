@@ -19,12 +19,11 @@ type TunDevice struct {
 }
 
 func NewTunDevice() (*TunDevice, error) {
-	// Сначала удаляем старый адаптер (если есть)
-	oldAdapter := exec.Command("wintun", "delete", "obelisk0")
+	oldAdapter := exec.Command("wintun", "delete", "l7shred")
 	oldAdapter.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	oldAdapter.Run()
 
-	tunDev, err := tun.CreateTUN("obelisk0", 1400)
+	tunDev, err := tun.CreateTUN("l7shred", 1400)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +70,6 @@ func (t *TunDevice) Close() error {
 }
 
 func (t *TunDevice) SetupIP(ip string) error {
-	// Сначала удаляем старый IP (если есть)
 	delCmd := exec.Command("netsh", "interface", "ip", "delete", "address",
 		t.name, ip)
 	delCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
@@ -81,7 +79,14 @@ func (t *TunDevice) SetupIP(ip string) error {
 		t.name, "static", ip, "255.255.255.0", "gateway=none")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Run(); err != nil {
-		return err
+		log.Printf("[TUN] netsh set address error: %v, trying alternative method", err)
+		cmd = exec.Command("netsh", "interface", "ip", "set", "address",
+			"name="+t.name, "source=static", "addr="+ip, "mask=255.255.255.0")
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd.Run(); err != nil {
+			log.Printf("[TUN] netsh alternative also failed: %v", err)
+			return err
+		}
 	}
 	log.Printf("Set IP %s on interface %s", ip, t.name)
 	return nil
@@ -91,7 +96,6 @@ func (t *TunDevice) Name() string {
 	return t.name
 }
 
-// SetFD - заглушка для Windows (не используется, но нужна для совместимости)
 func (t *TunDevice) SetFD(fd int) error {
 	return nil
 }

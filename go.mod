@@ -3,14 +3,12 @@ module github.com/l7-shred/core
 go 1.24.0
 
 require (
-	github.com/eycorsican/go-tun2socks v1.12.0
 	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
 	github.com/prometheus/client_golang v1.18.0
 	github.com/xtaci/kcp-go/v5 v5.6.72
 	golang.org/x/crypto v0.45.0
-	golang.org/x/net v0.47.0
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
 	google.golang.org/grpc v1.62.1
 	gorm.io/driver/postgres v1.5.11
@@ -36,6 +34,7 @@ require (
 	github.com/prometheus/procfs v0.12.0 // indirect
 	github.com/stretchr/testify v1.8.4 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
+	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
